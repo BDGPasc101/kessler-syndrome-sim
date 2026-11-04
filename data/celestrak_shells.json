@@ -1,0 +1,54 @@
+{
+    "400": {
+        "satellites": 0,
+        "debris": 350
+    },
+    "450": {
+        "satellites": 0,
+        "debris": 800
+    },
+    "500": {
+        "satellites": 0,
+        "debris": 1550
+    },
+    "550": {
+        "satellites": 0,
+        "debris": 2950
+    },
+    "600": {
+        "satellites": 0,
+        "debris": 6800
+    },
+    "650": {
+        "satellites": 0,
+        "debris": 11400
+    },
+    "700": {
+        "satellites": 0,
+        "debris": 15800
+    },
+    "750": {
+        "satellites": 0,
+        "debris": 21250
+    },
+    "800": {
+        "satellites": 0,
+        "debris": 25350
+    },
+    "850": {
+        "satellites": 0,
+        "debris": 22900
+    },
+    "900": {
+        "satellites": 0,
+        "debris": 8350
+    },
+    "950": {
+        "satellites": 0,
+        "debris": 5350
+    },
+    "1000": {
+        "satellites": 0,
+        "debris": 4150
+    }
+}
