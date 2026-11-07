@@ -91,3 +91,38 @@ A five-point validation suite guarantees physical and data integrity:
 | `test_nasa_breakup_energy_and_fragment_scaling` | Breakup Dynamics | Ensures catastrophic collision fragment counts scale with projectile and target mass according to NASA power-law distributions. |
 | `test_collision_probability_density_scaling` | Kinetic Gas Theory | Asserts that collision rates scale linearly when spatial density doubles ($\text{Rate} \propto \rho$). |
 | `test_laser_broom_targets_most_congested_shells_first` | Remediation Routing | Validates that active laser removal prioritizes the densest shell and does not exceed configured engagement quotas. |
+
+
+My Questions:
+"In what way is this model too simplistic - what assumptions do we make? For example, is the laser model too simple as it assumes every laser hit will cause a de-orbit? The material may remain an active hazard even if its velocity is reduce, as it drops to lower orbital shells"
+
+R: My point "highlights the central compromise of this simulation: it is a 1D thermodynamic "particle-in-a-box" model, not an orbital mechanics propagator."
+
+Steps to move it closer to an orbital mechanics propagator
+
+## 4. Model Limitations & Physical Simplifications
+
+While the 1D discrete-shell kinetic engine captures macro-scale cascade dynamics, it relies on several simplifying assumptions that abstract away real-world orbital and operational complexities:
+
+1. **Laser Broom De-Orbit Dynamics & Transiting Hazards:**
+   * **Instant Annihilation vs. Incremental $\Delta v$:** The model treats laser ablation as single-shot removals rather than thousands of low-impulse burns required to lower perigee.
+   * **Crossing Hazards:** Retarding an 800 km orbit transforms it into an eccentric transfer ellipse that slices through lower operational shells (400–750 km). In reality, de-orbiting debris temporarily increases lower-shell collision risk before atmospheric burn-up.
+   * **Secondary Fragmentation:** Real laser ablation carries risk of thermal shock or irregular torque, which can shatter composite debris into un-trackable millimeter fragments.
+
+2. **Isotropic Spatial Distribution vs. Orbital Plane Geometry:**
+   * **Homogeneous Gas Model:** The model distributes objects uniformly within each 50 km spherical shell.
+   * **Pinch Points & Convergence:** Real orbits concentrate around specific inclination bands (e.g., Sun-Synchronous Orbits at $97^\circ\text{–}98^\circ$ and polar paths), creating high-density congestion zones over Earth's poles rather than uniform global dispersion.
+   * **Neglected Orbital Eccentricity:** Rocket upper stages and transfer orbits (e.g., GTO) regularly sweep across multiple concentric shells at high relative velocities.
+
+3. **In-Shell Fragment Confinement & Uniform Area-to-Mass ($A/m$):**
+   * **Single-Shell Deposition:** All fragments generated in a collision are assigned back to the impact altitude. In reality, hypervelocity ejecta velocity vectors ($\Delta v_{\text{ejecta}}$) fling fragments hundreds of kilometers above and below the point of impact.
+   * **Monolithic Ballistic Properties:** Debris is assigned fixed mass (1 kg) and area ($0.01\text{ m}^2$). Real debris follows a broad log-normal $A/m$ distribution, where high-drag foils decay in weeks while dense metallic fragments linger for centuries.
+
+4. **Static Atmosphere vs. the 11-Year Solar Cycle:**
+   * **Constant Thermospheric Density:** The atmospheric drag module uses a static density-altitude curve.
+   * **Solar Flux Modulation:** Real thermospheric density fluctuates by a factor of 10 to 100 across the 11-year solar cycle ($F_{10.7}$ index). Solar maximums periodically scrub low-altitude debris, while solar minimums allow debris populations to stagnate.
+
+5. **Operational Behavior & Numerical Discretization:**
+   * **Zero Collision Avoidance (CAMs):** Active satellites are modeled as passive targets, ignoring real-world propulsive avoidance maneuvers triggered by Conjunction Assessment Risk Analysis (CARA).
+   * **100% Post-Mission Disposal (PMD):** Retired satellites are assumed to de-orbit reliably at end-of-life, whereas actual industry PMD compliance hovers between 60% and 85%, leaving a steady fraction of derelict hulks in orbit.
+   * **Time-Step Smoothing ($\Delta t = 1.0\text{ year}$):** Annual forward numerical integration averages out rapid, short-term collision cascade chain reactions that unfold over days or weeks.
