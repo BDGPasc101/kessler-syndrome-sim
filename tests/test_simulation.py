@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import pytest
 
 from src.simulation import KesslerSimulation, TransitingDebrisBatch
@@ -53,6 +54,56 @@ def test_atmospheric_drag_monotonic_downward_flux():
     assert sim.shells[idx_800].debris_count < 10_000.0, "800km debris failed to decay."
     idx_750 = next(i for i, s in enumerate(sim.shells) if s.altitude_km == 750)
     assert sim.shells[idx_750].debris_count > 0.0, "No downward flux received by 750km shell."
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
+
+
+def test_adaptive_drag_substeps_transport_debris_through_lower_shells():
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    sim.base_annual_launches = 0.0
+    for shell in sim.shells:
+        shell.legacy_sat_count = 0.0
+        shell.new_sat_count = 0.0
+        shell.debris_count = 0.0
+
+    shell_450 = next(s for s in sim.shells if s.altitude_km == 450)
+    shell_400 = next(s for s in sim.shells if s.altitude_km == 400)
+    shell_450.debris_count = 1_000.0
+
+    first_substep = sim._adaptive_substep_years(1.0)
+    assert first_substep <= 10.0 / 99.6133
+
+    sim.step(dt_years=1.0)
+
+    assert shell_450.debris_count < 1_000.0
+    assert shell_400.debris_count > 0.0
+    assert sim.reentered_mass_kg > 0.0
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
+
+
+def test_dense_collision_states_limit_per_substep_exposure():
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    sim.base_annual_launches = 0.0
+    for shell in sim.shells:
+        shell.legacy_sat_count = 0.0
+        shell.new_sat_count = 0.0
+        shell.derelict_count = 0.0
+        shell.debris_count = 0.0
+
+    shell = next(s for s in sim.shells if s.altitude_km == 800)
+    shell.legacy_sat_count = 100.0
+    shell.debris_count = 100_000_000.0
+    rate = calculate_impact_metrics(
+        shell.debris_count / shell.volume_km3, 5.0, 1.0, 10.0
+    )["rate_per_year"]
+
+    assert sim._adaptive_substep_years(1.0) <= 0.1 / rate
+
+    sim.step(dt_years=1.0)
+
+    assert all(
+        math.isfinite(value) and value >= 0.0
+        for value in (shell.sat_count, shell.debris_count, shell.debris_mass_kg)
+    )
     assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
 
 
@@ -239,8 +290,8 @@ def test_launch_pmd_derelict_and_atmospheric_reentry_lifecycle():
     assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-8)
 
     sim.step()
-    assert shell.derelict_count == pytest.approx(0.0)
-    assert sim.reentered_mass_kg == pytest.approx(2_500.0)
+    assert 0.0 < shell.derelict_count < 10.0
+    assert sim.reentered_mass_kg > 0.0
     assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-8)
 
 
@@ -259,7 +310,7 @@ def test_catastrophic_collision_consumes_target_and_projectile_mass_once():
 
     sim.step()
 
-    assert shell.sat_count == pytest.approx(0.0)
+    assert 0.0 < shell.sat_count < 1.0
     assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-8)
 
 

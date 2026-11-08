@@ -7,6 +7,8 @@ MU = 398600.4418
 EARTH_RADIUS_KM = 6378.137
 SATELLITE_MASS_KG = 250.0
 FRAGMENT_MASS_KG = 1.0
+MAX_DRAG_DISPLACEMENT_KM = 10.0
+MAX_COLLISION_EXPOSURE = 0.1
 
 @dataclass
 class TransitingDebrisBatch:
@@ -244,74 +246,59 @@ class KesslerSimulation:
             remaining -= consumed
         return amount - remaining
 
-    def step(self, dt_years: float = 1.0):
-        self._validate_step_inputs(dt_years)
-        if dt_years == 0:
-            return
-        launch_count = self._project_launches(dt_years)
+    def _adaptive_substep_years(self, remaining_years: float) -> float:
+        """Choose a step that resolves shell-to-shell drag and collision exposure."""
+        from src.physics.collisions import calculate_impact_metrics
+        from src.physics.drag import calculate_orbital_decay_rate
+
+        max_substep_years = remaining_years
+        max_collision_rate = 0.0
 
         for shell in self.shells:
-            self.initial_mass_kg += shell.sync_mass_after_external_count_change()
-
-        # 1. Update transiting batches (perigee drag decay)
-        for batch in self.transiting_batches:
-            elapsed_fraction = (
-                1.0 if batch.remaining_years <= 0
-                else min(1.0, dt_years / batch.remaining_years)
+            transiting_in_shell = self.get_transiting_debris_in_shell(
+                shell.altitude_km
             )
-            mass_before = batch.mass_kg
-            batch.count *= 1.0 - elapsed_fraction
-            batch.mass_kg *= 1.0 - elapsed_fraction
-            batch.remaining_years = max(0.0, batch.remaining_years - dt_years)
-            self.reentered_mass_kg += mass_before - batch.mass_kg
-        
-        # Purge batches that have completed atmospheric reentry
-        self.transiting_batches = [
-            batch for batch in self.transiting_batches if not batch.is_expired
-        ]
-
-        # 2. Risk-Based & Mass-Constrained Laser Broom Targeting
-        if self.laser_removals_per_year > 0:
-            # Assume 10% of tracked debris are massive objects (rocket bodies, dead buses) 
-            # with too much inertia for a laser to perturb. Only 90% are targetable fragments.
-            TARGETABLE_FRACTION = 0.90
-            
-            # Evaluate threat level: prioritize shells where debris and active satellites mix
-            def risk_score(shell):
-                targetable_debris = shell.debris_count * TARGETABLE_FRACTION
-                # If a shell has active sats, risk scales by potential collisions.
-                # If barren, fallback to cleaning the highest debris count (weighted low).
-                return targetable_debris * shell.sat_count if shell.sat_count > 0 else targetable_debris * 1e-6
-
-            target_shell = max(self.shells, key=risk_score)
-            
-            targetable_count = target_shell.debris_count * TARGETABLE_FRACTION
-            removals = min(targetable_count, self.laser_removals_per_year * dt_years)
-            
-            if removals > 0:
-                removed_mass = (
-                    target_shell.debris_mass_kg
-                    * removals
-                    / target_shell.debris_count
+            if shell.debris_count + transiting_in_shell > 0:
+                fragment_rate = calculate_orbital_decay_rate(
+                    shell.altitude_km, mass_kg=1.0, cross_section_m2=0.01
+                )["decay_rate_km_year"]
+                max_substep_years = min(
+                    max_substep_years,
+                    MAX_DRAG_DISPLACEMENT_KM / fragment_rate,
                 )
-                target_shell.debris_count -= removals
-                target_shell.debris_mass_kg -= removed_mass
-                
-                # If targeted above 400km, object enters elliptical transit crossing lower shells
-                if target_shell.altitude_km > 400.0:
-                    self.transiting_batches.append(
-                        TransitingDebrisBatch(
-                            count=removals,
-                            origin_altitude_km=target_shell.altitude_km,
-                            remaining_years=self.laser_transit_duration_years,
-                            transit_duration_years=self.laser_transit_duration_years,
-                            mass_kg=removed_mass,
-                        )
-                    )
-                else:
-                    self.reentered_mass_kg += removed_mass
+            if shell.derelict_count > 0:
+                derelict_rate = calculate_orbital_decay_rate(
+                    shell.altitude_km, mass_kg=250.0, cross_section_m2=5.0
+                )["decay_rate_km_year"]
+                max_substep_years = min(
+                    max_substep_years,
+                    MAX_DRAG_DISPLACEMENT_KM / derelict_rate,
+                )
 
-        # 3. Collision and Drag Integration per Shell
+            effective_debris = (
+                shell.debris_count + transiting_in_shell
+            )
+            impact_metrics = calculate_impact_metrics(
+                effective_debris / shell.volume_km3,
+                5.0,
+                remaining_years,
+                10.0,
+            )
+            max_collision_rate = max(
+                max_collision_rate, impact_metrics["rate_per_year"]
+            )
+
+        if max_collision_rate > 0:
+            max_substep_years = min(
+                max_substep_years,
+                MAX_COLLISION_EXPOSURE / max_collision_rate,
+            )
+
+        if max_substep_years <= 0 or not math.isfinite(max_substep_years):
+            raise ValueError("Adaptive integration produced an invalid substep.")
+        return max_substep_years
+
+    def _integrate_collision_and_drag_substep(self, dt_years: float):
         from src.physics.collisions import calculate_impact_metrics
         from src.physics.drag import calculate_orbital_decay_rate
         from src.physics.breakup import calculate_breakup_fragments
@@ -323,31 +310,22 @@ class KesslerSimulation:
 
         for i in reversed(range(len(self.shells))):
             shell = self.shells[i]
-            
-            # Incorporate transiting eccentric debris into local spatial density
-            transiting_in_shell = self.get_transiting_debris_in_shell(shell.altitude_km)
-            
-            # Spatial density of PROJECTILES (fragments + transiting debris)
+            transiting_in_shell = self.get_transiting_debris_in_shell(
+                shell.altitude_km
+            )
             effective_debris = shell.debris_count + transiting_in_shell
             spatial_density = effective_debris / shell.volume_km3
-
-            # Calculate collision probability for massive targets (5.0 m^2 cross section)
             impact_metrics = calculate_impact_metrics(
-                spatial_density,
-                5.0,
-                dt_years,
-                10.0
+                spatial_density, 5.0, dt_years, 10.0
             )
 
-            # --- KESSLER CASCADE LOGIC ---
             active_targets = shell.sat_count
             derelict_targets = shell.derelict_count
-            raw_active_collisions = (
-                impact_metrics["rate_per_year"] * active_targets * dt_years
+            collision_probability = -math.expm1(
+                -impact_metrics["rate_per_year"] * dt_years
             )
-            raw_derelict_collisions = (
-                impact_metrics["rate_per_year"] * derelict_targets * dt_years
-            )
+            raw_active_collisions = collision_probability * active_targets
+            raw_derelict_collisions = collision_probability * derelict_targets
             raw_total_collisions = raw_active_collisions + raw_derelict_collisions
 
             transit_projectiles = sum(
@@ -369,10 +347,8 @@ class KesslerSimulation:
             )
 
             if total_shatter_events > 0 and raw_total_collisions > 0:
-                projectile_mass = FRAGMENT_MASS_KG
                 projectile_count_consumed = self._consume_projectiles(
-                    shell,
-                    total_shatter_events,
+                    shell, total_shatter_events
                 )
                 total_shatter_events = projectile_count_consumed
                 active_events = total_shatter_events * (
@@ -380,14 +356,16 @@ class KesslerSimulation:
                 )
                 derelict_events = total_shatter_events - active_events
 
-                def apply_collision(target_count: float, target_mass: float, events: float):
+                def apply_collision(
+                    target_count: float, target_mass: float, events: float
+                ):
                     if events <= 0 or target_count <= 0:
                         return 0.0, 0.0
 
                     average_target_mass = target_mass / target_count
                     breakup_data = calculate_breakup_fragments(
                         target_mass_kg=average_target_mass,
-                        projectile_mass_kg=projectile_mass,
+                        projectile_mass_kg=FRAGMENT_MASS_KG,
                         impact_velocity_km_s=10.0,
                         fragment_mass_kg=FRAGMENT_MASS_KG,
                     )
@@ -404,19 +382,15 @@ class KesslerSimulation:
                         return destroyed_count, destroyed_mass
 
                     retained_mass_change = (
-                        projectile_mass - breakup_data["ejecta_mass_kg"]
+                        FRAGMENT_MASS_KG - breakup_data["ejecta_mass_kg"]
                     ) * events
                     return 0.0, -retained_mass_change
 
                 active_destroyed, active_mass_removed = apply_collision(
-                    active_targets,
-                    shell.satellite_mass_kg,
-                    active_events,
+                    active_targets, shell.satellite_mass_kg, active_events
                 )
                 derelict_destroyed, derelict_mass_removed = apply_collision(
-                    derelict_targets,
-                    shell.derelict_mass_kg,
-                    derelict_events,
+                    derelict_targets, shell.derelict_mass_kg, derelict_events
                 )
 
                 if active_destroyed > 0:
@@ -427,31 +401,37 @@ class KesslerSimulation:
                 shell.satellite_mass_kg -= active_mass_removed
                 shell.derelict_count -= derelict_destroyed
                 shell.derelict_mass_kg -= derelict_mass_removed
-            # -----------------------------------------
 
-            # Atmospheric drag for tiny Fragments (Mass = 1.0kg, Area = 0.01m2)
-            decay_dict_frag = calculate_orbital_decay_rate(shell.altitude_km, mass_kg=1.0, cross_section_m2=0.01)
-            decay_frac_frag = min(1.0, (decay_dict_frag['decay_rate_km_year'] * dt_years) / 50.0)
+            fragment_rate = calculate_orbital_decay_rate(
+                shell.altitude_km, mass_kg=1.0, cross_section_m2=0.01
+            )["decay_rate_km_year"]
+            decay_frac_frag = -math.expm1(
+                -(fragment_rate * dt_years) / 50.0
+            )
             debris_leaving = shell.debris_count * decay_frac_frag
             debris_mass_leaving = shell.debris_mass_kg * decay_frac_frag
             shell.debris_count -= debris_leaving
             shell.debris_mass_kg -= debris_mass_leaving
-            
-            # Atmospheric drag for heavy Derelicts (Mass = 250.0kg, Area = 5.0m2)
-            decay_dict_derelict = calculate_orbital_decay_rate(shell.altitude_km, mass_kg=250.0, cross_section_m2=5.0)
-            decay_frac_derelict = min(1.0, (decay_dict_derelict['decay_rate_km_year'] * dt_years) / 50.0)
+
+            derelict_rate = calculate_orbital_decay_rate(
+                shell.altitude_km, mass_kg=250.0, cross_section_m2=5.0
+            )["decay_rate_km_year"]
+            decay_frac_derelict = -math.expm1(
+                -(derelict_rate * dt_years) / 50.0
+            )
             derelicts_leaving = shell.derelict_count * decay_frac_derelict
-            derelict_mass_leaving = shell.derelict_mass_kg * decay_frac_derelict
+            derelict_mass_leaving = (
+                shell.derelict_mass_kg * decay_frac_derelict
+            )
             shell.derelict_count -= derelicts_leaving
             shell.derelict_mass_kg -= derelict_mass_leaving
 
-            # Apply downward mass flux into lower shell
             if i + 1 < len(self.shells):
                 shell.debris_count += downward_debris_flux
                 shell.debris_mass_kg += downward_debris_mass_flux
                 shell.derelict_count += downward_derelict_flux
                 shell.derelict_mass_kg += downward_derelict_mass_flux
-            
+
             downward_debris_flux = debris_leaving
             downward_debris_mass_flux = debris_mass_leaving
             downward_derelict_flux = derelicts_leaving
@@ -461,8 +441,89 @@ class KesslerSimulation:
                 self.reentered_mass_kg += (
                     debris_mass_leaving + derelict_mass_leaving
                 )
-            
-            # Satellite lifespan turnover
+
+    def step(self, dt_years: float = 1.0):
+        self._validate_step_inputs(dt_years)
+        if dt_years == 0:
+            return
+        launch_count = self._project_launches(dt_years)
+
+        for shell in self.shells:
+            self.initial_mass_kg += shell.sync_mass_after_external_count_change()
+
+        # 1. Update transiting batches (perigee drag decay)
+        for batch in self.transiting_batches:
+            elapsed_fraction = (
+                1.0 if batch.remaining_years <= 0
+                else min(1.0, dt_years / batch.remaining_years)
+            )
+            mass_before = batch.mass_kg
+            batch.count *= 1.0 - elapsed_fraction
+            batch.mass_kg *= 1.0 - elapsed_fraction
+            batch.remaining_years = max(0.0, batch.remaining_years - dt_years)
+            self.reentered_mass_kg += mass_before - batch.mass_kg
+
+        # Purge batches that have completed atmospheric reentry
+        self.transiting_batches = [
+            batch for batch in self.transiting_batches if not batch.is_expired
+        ]
+
+        # 2. Risk-Based & Mass-Constrained Laser Broom Targeting
+        if self.laser_removals_per_year > 0:
+            # Assume 10% of tracked debris are massive objects (rocket bodies, dead buses)
+            # with too much inertia for a laser to perturb. Only 90% are targetable fragments.
+            TARGETABLE_FRACTION = 0.90
+
+            # Evaluate threat level: prioritize shells where debris and active satellites mix
+            def risk_score(shell):
+                targetable_debris = shell.debris_count * TARGETABLE_FRACTION
+                # If a shell has active sats, risk scales by potential collisions.
+                # If barren, fallback to cleaning the highest debris count (weighted low).
+                return targetable_debris * shell.sat_count if shell.sat_count > 0 else targetable_debris * 1e-6
+
+            target_shell = max(self.shells, key=risk_score)
+
+            targetable_count = target_shell.debris_count * TARGETABLE_FRACTION
+            removals = min(targetable_count, self.laser_removals_per_year * dt_years)
+
+            if removals > 0:
+                removed_mass = (
+                    target_shell.debris_mass_kg
+                    * removals
+                    / target_shell.debris_count
+                )
+                target_shell.debris_count -= removals
+                target_shell.debris_mass_kg -= removed_mass
+
+                # If targeted above 400km, object enters elliptical transit crossing lower shells
+                if target_shell.altitude_km > 400.0:
+                    self.transiting_batches.append(
+                        TransitingDebrisBatch(
+                            count=removals,
+                            origin_altitude_km=target_shell.altitude_km,
+                            remaining_years=self.laser_transit_duration_years,
+                            transit_duration_years=self.laser_transit_duration_years,
+                            mass_kg=removed_mass,
+                        )
+                    )
+                else:
+                    self.reentered_mass_kg += removed_mass
+
+        # 3. Integrate collision and drag changes without altering outer-step events.
+        elapsed_years = 0.0
+        while elapsed_years < dt_years:
+            remaining_years = dt_years - elapsed_years
+            substep_years = self._adaptive_substep_years(remaining_years)
+            if elapsed_years + substep_years == elapsed_years:
+                raise ValueError("Adaptive integration step is below time precision.")
+            self._integrate_collision_and_drag_substep(substep_years)
+            if substep_years == remaining_years:
+                elapsed_years = dt_years
+            else:
+                elapsed_years += substep_years
+
+        # 4. Satellite lifespan turnover remains once per requested step.
+        for shell in self.shells:
             loss_fraction = min(1.0, dt_years / self.sat_lifespan_years)
             legacy_loss = shell.legacy_sat_count * loss_fraction
             new_loss = shell.new_sat_count * loss_fraction
@@ -483,7 +544,7 @@ class KesslerSimulation:
             shell.derelict_mass_kg += failed_satellite_mass
             self.reentered_mass_kg += lost_satellite_mass - failed_satellite_mass
 
-        # 4. Inject new launches
+        # 5. Inject new launches
         target_shells = [s for s in self.shells if s.altitude_km in [450, 500, 550]]
         if target_shells:
             per_shell = launch_count / len(target_shells)
