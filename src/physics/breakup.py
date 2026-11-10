@@ -16,6 +16,29 @@ HEAVY_CHUNK_RADIUS_M = (
 HEAVY_CHUNK_CROSS_SECTION_M2 = math.pi * HEAVY_CHUNK_RADIUS_M**2
 HEAVY_MASS_FRACTION = 0.8
 WHIPPLE_SHIELD_LETHAL_ENERGY_J = 100_000.0
+EJECTA_SHELL_SPREAD_WEIGHTS = (
+    (-2, 0.05),
+    (-1, 0.15),
+    (0, 0.60),
+    (1, 0.15),
+    (2, 0.05),
+)
+
+
+def validate_ejecta_shell_spread_weights() -> None:
+    """Ensure the discrete Gaussian-inspired shell kernel conserves ejecta."""
+    if any(
+        not math.isfinite(weight) or weight < 0.0
+        for _, weight in EJECTA_SHELL_SPREAD_WEIGHTS
+    ):
+        raise ValueError("Ejecta shell spread weights must be finite and nonnegative.")
+    if not math.isclose(
+        sum(weight for _, weight in EJECTA_SHELL_SPREAD_WEIGHTS),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("Ejecta shell spread weights must sum to one.")
 
 
 def calculate_kinetic_energy_j(

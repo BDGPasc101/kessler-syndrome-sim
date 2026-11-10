@@ -5,17 +5,52 @@ import numpy as np # Make sure numpy is imported at the top of your app.py
 
 from src.simulation import KesslerSimulation
 from src.physics.collisions import calculate_impact_metrics
+from src.physics.drag import SOLAR_CYCLE_PERIOD_YEARS
 
 st.set_page_config(page_title="Kessler Syndrome Simulator", layout="wide")
 
-@st.cache_data
-def run_simulation(years: int, base_launches: int, growth_rate_pct: float, global_lifespan: int, pmd_failure_pct: float, laser_removals: int, enable_dynamic_highway_routing: bool):
+
+def add_solar_maximum_bands(figure, final_year: float):
+    band_half_width = 1.75
+    peak_year = 0.0
+    while peak_year - band_half_width <= final_year:
+        start_year = max(0.0, peak_year - band_half_width)
+        end_year = min(final_year, peak_year + band_half_width)
+        if end_year > start_year:
+            figure.add_vrect(
+                x0=start_year,
+                x1=end_year,
+                fillcolor="#F4D35E",
+                opacity=0.1,
+                line_width=0,
+                layer="below",
+            )
+        peak_year += SOLAR_CYCLE_PERIOD_YEARS
+    return figure
+
+
+@st.cache_data(show_spinner="Simulating orbital cascade across 13 shells...")
+def run_simulation(
+    years: int,
+    base_launches: int,
+    growth_rate_pct: float,
+    global_lifespan: int,
+    pmd_failure_pct: float,
+    laser_removals: int,
+    enable_dynamic_highway_routing: bool,
+    cams_efficiency: float,
+    cam_burns_per_satellite: float,
+    cam_screening_radius_km: float,
+):
     sim = KesslerSimulation()
     
     sim.base_annual_launches = base_launches
     sim.launch_growth_rate = growth_rate_pct / 100.0
     sim.sat_lifespan_years = float(global_lifespan)
     sim.pmd_failure_rate = pmd_failure_pct / 100.0   # Added this line
+    sim.cams_efficiency = cams_efficiency
+    sim.cam_screening_radius_km = cam_screening_radius_km
+    sim.set_cam_burns_per_satellite(cam_burns_per_satellite)
     sim.laser_removals_per_year = laser_removals
     sim.enable_dynamic_highway_routing = enable_dynamic_highway_routing
     
@@ -50,7 +85,6 @@ def run_simulation(years: int, base_launches: int, growth_rate_pct: float, globa
                 "Diverted Launches": sim.launches_diverted_this_step,
                 "Volume (km3)": shell.volume_km3
             })
-            
     df = pd.DataFrame(history)
     # Effective debris is what satellites actually collide with
     df["Effective Debris"] = (
@@ -63,7 +97,14 @@ st.sidebar.header("Global Space Economy")
 base_launches = st.sidebar.slider("Base Annual Launches", min_value=0, max_value=10000, value=2500, step=500)
 launch_growth = st.sidebar.slider("Annual Launch Growth (%)", min_value=0.0, max_value=30.0, value=8.0, step=1.0)
 global_lifespan = st.sidebar.slider("Constellation Lifespan (Years)", min_value=1, max_value=15, value=5)
-pmd_failure_pct = st.sidebar.slider("PMD Failure Rate (%)", min_value=0.0, max_value=100.0, value=10.0, step=1.0, help="Percentage of satellites that fail to de-orbit at end of life, becoming permanent derelict debris.")
+pmd_failure_pct = st.sidebar.slider(
+    "PMD Failure Rate (%)",
+    min_value=0.0,
+    max_value=100.0,
+    value=10.0,
+    step=1.0,
+    help="Baseline percentage of satellites that fail to de-orbit. Cohorts that exhaust their CAM reserve have 0% PMD compliance and become derelicts at retirement.",
+)
 
 st.sidebar.header("Active Debris Removal")
 num_facilities = st.sidebar.slider("Global Laser Facilities", min_value=1, max_value=10, value=1, step=1, help="Number of ground stations built worldwide.")
@@ -96,18 +137,38 @@ sat_altitude = st.sidebar.selectbox(
 )
 sat_area_m2 = st.sidebar.slider("Cross-Section Area (m²)", min_value=1.0, max_value=100.0, value=10.0, step=1.0)
 sat_lifespan = st.sidebar.slider("Planned Mission Duration (Years)", min_value=1, max_value=25, value=5)
+cams_efficiency = st.sidebar.slider(
+    "CAM Avoidance Efficiency (%)", min_value=0, max_value=100, value=90
+) / 100.0
+cam_burns_per_satellite = st.sidebar.slider(
+    "CAM Burn Reserve (Burns / Satellite)",
+    min_value=0,
+    max_value=200,
+    value=75,
+    help="Average screening maneuvers available per satellite. Exhausted cohorts lose CAMs and fail PMD at retirement.",
+)
+cam_screening_radius_km = st.sidebar.slider(
+    "CAM Screening Radius (km)",
+    min_value=0.5,
+    max_value=1.0,
+    value=0.75,
+    step=0.05,
+    help="Conjunction screening radius; this bubble determines warning and maneuver-burn rates, not physical collision area.",
+)
 
 # --- RUN SIMULATION ---
-with st.spinner("Integrating ODEs & crossing hazards..."):
-    df_history = run_simulation(
-        sim_years,
-        base_launches,
-        launch_growth,
-        global_lifespan,
-        pmd_failure_pct,
-        laser_removals,
-        enable_dynamic_highway_routing,
-    )
+df_history = run_simulation(
+    sim_years,
+    base_launches,
+    launch_growth,
+    global_lifespan,
+    pmd_failure_pct,
+    laser_removals,
+    enable_dynamic_highway_routing,
+    cams_efficiency,
+    cam_burns_per_satellite,
+    cam_screening_radius_km,
+)
 
 # --- MAIN DASHBOARD ---
 st.title("🌍 Orbital Debris Cascade Simulator")
@@ -191,7 +252,10 @@ with tab_heatmap:
 
 with tab_debris:
     st.subheader("Global Debris Inventory")
-    st.caption("Shows 1 cm shrapnel, 10 kg heavy chunks, and temporary transiting debris. (Logarithmic Scale)")
+    st.caption(
+        "Shows 1 cm shrapnel, 10 kg heavy chunks, and temporary transiting "
+        "debris. Faint bands mark solar maxima in the modeled 11-year cycle."
+    )
     df_agg = df_history.groupby("Year")[[
         "Circular Debris", "Heavy Debris", "Transiting Debris"
     ]].sum().reset_index()
@@ -212,6 +276,7 @@ with tab_debris:
         legend_title="Population",
         yaxis_type="log"  # Enforces log scale on the area chart
     )
+    add_solar_maximum_bands(fig_inv, sim_years)
     st.plotly_chart(fig_inv, use_container_width=True)
     
 with tab_sats:
@@ -246,6 +311,7 @@ with tab_sats:
 
 with tab_lifespan:
     st.subheader(f"Mission Viability at {sat_altitude} km")
+    st.caption("Faint bands mark solar maxima in the modeled 11-year cycle.")
     df_alt = df_history[df_history["Altitude (km)"] == sat_altitude].copy()
     mtbi_list = []
     prob_list = []
@@ -278,6 +344,7 @@ with tab_lifespan:
     )
     fig_prob = px.bar(df_alt, x="Year", y="Catastrophic Breach Risk (%)", title=f"Probability of catastrophic breach during a {sat_lifespan}-year mission", color="Catastrophic Breach Risk (%)", color_continuous_scale="Reds")
     fig_prob.update_layout(template="plotly_dark", height=400, yaxis_range=[0, 100])
+    add_solar_maximum_bands(fig_prob, sim_years)
     st.plotly_chart(fig_prob, use_container_width=True)
 
 with tab_finance:

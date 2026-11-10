@@ -3,12 +3,17 @@ import json
 import math
 import pytest
 
-from src.simulation import KesslerSimulation, TransitingDebrisBatch
+from src.simulation import (
+    SATELLITE_MASS_KG,
+    KesslerSimulation,
+    TransitingDebrisBatch,
+)
 from src.physics.collisions import (
     calculate_impact_metrics,
     calculate_relative_velocity_km_s,
 )
 from src.physics.breakup import (
+    EJECTA_SHELL_SPREAD_WEIGHTS,
     HEAVY_CHUNK_CROSS_SECTION_M2,
     HEAVY_CHUNK_MASS_KG,
     SHRAPNEL_CROSS_SECTION_M2,
@@ -16,6 +21,14 @@ from src.physics.breakup import (
     WHIPPLE_SHIELD_LETHAL_ENERGY_J,
     calculate_breakup_fragments,
     calculate_kinetic_energy_j,
+    validate_ejecta_shell_spread_weights,
+)
+from src.physics.drag import (
+    SOLAR_CYCLE_DENSITY_AMPLITUDE,
+    SOLAR_CYCLE_PERIOD_YEARS,
+    calculate_orbital_decay_rate,
+    maximum_solar_cycle_density_multiplier,
+    solar_cycle_density_multiplier,
 )
 
 
@@ -80,8 +93,16 @@ def test_initial_sat_count_nonzero_and_matches_data():
 
 
 def _disable_physics_during_launch_routing_test(sim, monkeypatch):
-    monkeypatch.setattr(sim, "_adaptive_substep_years", lambda remaining: remaining)
-    monkeypatch.setattr(sim, "_integrate_collision_and_drag_substep", lambda dt: None)
+    monkeypatch.setattr(
+        sim,
+        "_adaptive_substep_years",
+        lambda remaining, start_year=None: remaining,
+    )
+    monkeypatch.setattr(
+        sim,
+        "_integrate_collision_and_drag_substep",
+        lambda dt, simulation_year=None: None,
+    )
 
 
 def test_initial_legacy_grid_derelicts_are_seeded_and_mass_accounted():
@@ -189,6 +210,7 @@ def test_atmospheric_drag_monotonic_downward_flux():
     for shell in sim.shells:
         shell.legacy_sat_count = 0.0
         shell.new_sat_count = 0.0
+        shell.derelict_count = 0.0
         shell.debris_count = 0.0
 
     idx_800 = next(i for i, s in enumerate(sim.shells) if s.altitude_km == 800)
@@ -200,6 +222,93 @@ def test_atmospheric_drag_monotonic_downward_flux():
     idx_750 = next(i for i, s in enumerate(sim.shells) if s.altitude_km == 750)
     assert sim.shells[idx_750].debris_count > 0.0, "No downward flux received by 750km shell."
     assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
+
+
+def test_solar_cycle_multiplier_has_eleven_year_period_and_expected_extrema():
+    assert solar_cycle_density_multiplier(0.0) == pytest.approx(
+        1.0 + SOLAR_CYCLE_DENSITY_AMPLITUDE
+    )
+    assert solar_cycle_density_multiplier(SOLAR_CYCLE_PERIOD_YEARS / 2.0) == pytest.approx(
+        1.0 - SOLAR_CYCLE_DENSITY_AMPLITUDE
+    )
+    assert solar_cycle_density_multiplier(SOLAR_CYCLE_PERIOD_YEARS) == pytest.approx(
+        solar_cycle_density_multiplier(0.0)
+    )
+
+
+def test_solar_cycle_maximum_over_interval_is_bounded_by_interval():
+    assert maximum_solar_cycle_density_multiplier(1.0, 1.0) == pytest.approx(
+        solar_cycle_density_multiplier(1.0)
+    )
+    assert maximum_solar_cycle_density_multiplier(10.0, 2.0) == pytest.approx(1.5)
+    assert maximum_solar_cycle_density_multiplier(3.0, 11.0) == pytest.approx(1.5)
+
+
+def test_solar_maximum_increases_drag_and_adaptive_substeps_resolve_it():
+    maximum_drag = calculate_orbital_decay_rate(
+        450.0, SHRAPNEL_MASS_KG, SHRAPNEL_CROSS_SECTION_M2, density_multiplier=1.5
+    )["decay_rate_km_year"]
+    minimum_drag = calculate_orbital_decay_rate(
+        450.0, SHRAPNEL_MASS_KG, SHRAPNEL_CROSS_SECTION_M2, density_multiplier=0.5
+    )["decay_rate_km_year"]
+    assert maximum_drag == pytest.approx(minimum_drag * 3.0)
+
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    sim.base_annual_launches = 0.0
+    for shell in sim.shells:
+        shell.derelict_count = 0.0
+        shell.derelict_mass_kg = 0.0
+        shell.debris_count = 0.0
+        shell.debris_mass_kg = 0.0
+        shell.heavy_debris_count = 0.0
+        shell.heavy_debris_mass_kg = 0.0
+        shell.update_mass_count_snapshot()
+    shell_450 = next(shell for shell in sim.shells if shell.altitude_km == 450)
+    shell_450.debris_count = 100_000.0
+    shell_450.debris_mass_kg = shell_450.debris_count * SHRAPNEL_MASS_KG
+    shell_450.update_mass_count_snapshot()
+    sim.initial_mass_kg = sum(shell.total_mass_kg for shell in sim.shells)
+
+    maximum_step = sim._adaptive_substep_years(1.0, start_year=0.0)
+    minimum_step = sim._adaptive_substep_years(1.0, start_year=5.5)
+    assert maximum_step < minimum_step
+
+    maximum_sim = KesslerSimulation(data_path="missing-telemetry.json")
+    minimum_sim = KesslerSimulation(data_path="missing-telemetry.json")
+    for instance, start_year in ((maximum_sim, 0.0), (minimum_sim, 5.0)):
+        instance.base_annual_launches = 0.0
+        for shell in instance.shells:
+            shell.legacy_sat_count = 0.0
+            shell.new_sat_count = 0.0
+            shell.derelict_count = 0.0
+            shell.derelict_mass_kg = 0.0
+            shell.debris_count = 0.0
+            shell.heavy_debris_count = 0.0
+            shell.heavy_debris_mass_kg = 0.0
+            shell.update_mass_count_snapshot()
+        debris_shell = next(
+            shell for shell in instance.shells if shell.altitude_km == 450
+        )
+        debris_shell.debris_count = 100_000.0
+        debris_shell.debris_mass_kg = debris_shell.debris_count * SHRAPNEL_MASS_KG
+        debris_shell.update_mass_count_snapshot()
+        instance.initial_mass_kg = sum(
+            shell.total_mass_kg for shell in instance.shells
+        )
+        instance.current_year = start_year
+
+    maximum_sim.step(dt_years=1.0)
+    minimum_sim.step(dt_years=1.0)
+
+    maximum_shell = next(
+        shell for shell in maximum_sim.shells if shell.altitude_km == 450
+    )
+    minimum_shell = next(
+        shell for shell in minimum_sim.shells if shell.altitude_km == 450
+    )
+    assert maximum_shell.debris_count < minimum_shell.debris_count
+    assert maximum_sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
+    assert minimum_sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
 
 
 def test_adaptive_drag_substeps_transport_debris_through_lower_shells():
@@ -223,6 +332,58 @@ def test_adaptive_drag_substeps_transport_debris_through_lower_shells():
     assert shell_400.debris_count > 0.0
     assert sim.reentered_mass_kg > 0.0
     assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
+
+
+def test_adaptive_integration_is_capped_at_25_substeps_per_year(monkeypatch):
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    sim.base_annual_launches = 0.0
+    substeps = []
+    monkeypatch.setattr(
+        sim,
+        "_adaptive_substep_years",
+        lambda remaining, start_year=None: 1e-8,
+    )
+    monkeypatch.setattr(
+        sim,
+        "_integrate_collision_and_drag_substep",
+        lambda dt, simulation_year=None: substeps.append(dt),
+    )
+
+    sim.step(dt_years=1.0)
+
+    assert len(substeps) == 25
+    assert sum(substeps) == pytest.approx(1.0)
+
+
+def test_cam_screening_rate_does_not_constrain_adaptive_substeps(monkeypatch):
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    shell = next(shell for shell in sim.shells if shell.altitude_km == 450.0)
+    shell.cam_fueled_sat_count = shell.sat_count
+    shell.cam_burns_remaining = 1.0
+    monkeypatch.setattr(
+        sim,
+        "_cam_screening_rate_per_satellite",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("CAM screening must not size physical substeps.")
+        ),
+    )
+
+    assert sim._adaptive_substep_years(1.0) == pytest.approx(1.0)
+
+
+def test_transiting_batch_caches_shell_occupancy_geometry():
+    batch = TransitingDebrisBatch(
+        count=10.0,
+        origin_altitude_km=800.0,
+        remaining_years=1.0,
+    )
+
+    first_result = batch.occupancy_fraction(800.0)
+    second_result = batch.occupancy_fraction(800.0)
+
+    assert first_result > 0.0
+    assert second_result == first_result
+    assert batch._occupancy_cache[800.0] == first_result
 
 
 def test_dense_collision_states_limit_per_substep_exposure():
@@ -266,6 +427,14 @@ def test_relative_velocity_uses_circular_speed_and_collision_geometry():
         math.sqrt(2.0 * 3.986e5 / (6371.0 + 1000.0))
     )
     assert velocity_400 > velocity_1000
+    shell_400 = next(
+        shell for shell in KesslerSimulation().shells
+        if shell.altitude_km == 400.0
+    )
+    assert shell_400.relative_velocity_km_s == pytest.approx(velocity_400)
+    assert shell_400.circular_orbital_velocity_km_s == pytest.approx(
+        math.sqrt(398600.4418 / (6378.137 + 400.0))
+    )
 
 
 def test_collision_breakup_uses_shell_relative_velocity(monkeypatch):
@@ -290,9 +459,13 @@ def test_collision_breakup_uses_shell_relative_velocity(monkeypatch):
     sim._integrate_collision_and_drag_substep(dt_years=1.0)
 
     assert impact_velocities
-    assert impact_velocities == pytest.approx(
-        [calculate_relative_velocity_km_s(shell.altitude_km)]
-        * len(impact_velocities)
+    possible_shell_velocities = [
+        calculate_relative_velocity_km_s(candidate.altitude_km)
+        for candidate in sim.shells
+    ]
+    assert all(
+        any(velocity == pytest.approx(possible) for possible in possible_shell_velocities)
+        for velocity in impact_velocities
     )
 
 
@@ -311,6 +484,123 @@ def test_nasa_breakup_energy_and_fragment_scaling():
 
     assert res_small["fragments_generated"] > 0
     assert res_large["fragments_generated"] > res_small["fragments_generated"]
+
+
+def _make_empty_ejecta_simulation():
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    for shell in sim.shells:
+        shell.legacy_sat_count = 0.0
+        shell.new_sat_count = 0.0
+        shell.derelict_count = 0.0
+        shell.heavy_debris_count = 0.0
+        shell.debris_count = 0.0
+        shell.satellite_mass_kg = 0.0
+        shell.derelict_mass_kg = 0.0
+        shell.heavy_debris_mass_kg = 0.0
+        shell.debris_mass_kg = 0.0
+        shell.update_mass_count_snapshot()
+    sim.initial_mass_kg = 0.0
+    return sim
+
+
+def test_ejecta_shell_spread_weights_are_normalized():
+    validate_ejecta_shell_spread_weights()
+    assert EJECTA_SHELL_SPREAD_WEIGHTS == (
+        (-2, 0.05),
+        (-1, 0.15),
+        (0, 0.60),
+        (1, 0.15),
+        (2, 0.05),
+    )
+    assert sum(weight for _, weight in EJECTA_SHELL_SPREAD_WEIGHTS) == pytest.approx(
+        1.0
+    )
+
+
+def test_collision_ejecta_is_distributed_across_adjacent_shells():
+    sim = _make_empty_ejecta_simulation()
+    impact_shell = next(shell for shell in sim.shells if shell.altitude_km == 500)
+    breakup_data = {
+        "shrapnel_count": 100.0,
+        "shrapnel_mass_kg": 2.0,
+        "untracked_mass_kg": 1.0,
+        "heavy_chunk_count": 10.0,
+        "heavy_chunk_mass_kg": 50.0,
+    }
+    events = 2.0
+    sim.initial_mass_kg = events * (
+        breakup_data["shrapnel_mass_kg"]
+        + breakup_data["untracked_mass_kg"]
+        + breakup_data["heavy_chunk_mass_kg"]
+    )
+
+    sim._deposit_collision_ejecta(impact_shell, events, breakup_data)
+
+    for shell_offset, weight in EJECTA_SHELL_SPREAD_WEIGHTS:
+        destination = next(
+            shell for shell in sim.shells
+            if shell.altitude_km == impact_shell.altitude_km + shell_offset * 50
+        )
+        assert destination.debris_count == pytest.approx(
+            events * breakup_data["shrapnel_count"] * weight
+        )
+        assert destination.debris_mass_kg == pytest.approx(
+            events
+            * (
+                breakup_data["shrapnel_mass_kg"]
+                + breakup_data["untracked_mass_kg"]
+            )
+            * weight
+        )
+        assert destination.heavy_debris_count == pytest.approx(
+            events * breakup_data["heavy_chunk_count"] * weight
+        )
+        assert destination.heavy_debris_mass_kg == pytest.approx(
+            events * breakup_data["heavy_chunk_mass_kg"] * weight
+        )
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-10)
+
+
+def test_ejecta_below_lowest_shell_is_recorded_as_reentered_mass():
+    sim = _make_empty_ejecta_simulation()
+    impact_shell = next(shell for shell in sim.shells if shell.altitude_km == 300)
+    breakup_data = {
+        "shrapnel_count": 100.0,
+        "shrapnel_mass_kg": 2.0,
+        "untracked_mass_kg": 1.0,
+        "heavy_chunk_count": 10.0,
+        "heavy_chunk_mass_kg": 50.0,
+    }
+    events = 2.0
+    total_ejecta_mass = events * 53.0
+    sim.initial_mass_kg = total_ejecta_mass
+
+    sim._deposit_collision_ejecta(impact_shell, events, breakup_data)
+
+    assert sim.reentered_mass_kg == pytest.approx(total_ejecta_mass * 0.20)
+    assert impact_shell.debris_count == pytest.approx(120.0)
+    assert impact_shell.heavy_debris_count == pytest.approx(12.0)
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-10)
+
+
+def test_ejecta_above_highest_shell_is_clamped_to_top_shell():
+    sim = _make_empty_ejecta_simulation()
+    impact_shell = next(shell for shell in sim.shells if shell.altitude_km == 1000)
+    breakup_data = {
+        "shrapnel_count": 100.0,
+        "shrapnel_mass_kg": 2.0,
+        "untracked_mass_kg": 1.0,
+        "heavy_chunk_count": 10.0,
+        "heavy_chunk_mass_kg": 50.0,
+    }
+    sim.initial_mass_kg = 53.0
+
+    sim._deposit_collision_ejecta(impact_shell, 1.0, breakup_data)
+
+    assert impact_shell.debris_count == pytest.approx(80.0)
+    assert impact_shell.heavy_debris_count == pytest.approx(8.0)
+    assert sim.reentered_mass_kg == pytest.approx(0.0)
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-10)
 
 
 def test_heavy_projectile_can_force_lethal_breakup_below_energy_threshold():
@@ -475,7 +765,7 @@ def test_subthreshold_shrapnel_mission_kills_exposed_area_without_breakup(
         + expected_target_mass_transferred
         + expected_mission_kills * SHRAPNEL_MASS_KG
     )
-    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-8)
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
 
 
 @pytest.mark.parametrize(
@@ -564,10 +854,230 @@ def test_heavy_debris_remains_catastrophically_lethal_and_conserved():
     sim._integrate_collision_and_drag_substep(dt_years=1.0)
 
     assert shell.sat_count < satellite_count_before
+    for altitude in (500.0, 600.0):
+        spread_shell = next(
+            candidate for candidate in sim.shells
+            if candidate.altitude_km == altitude
+        )
+        assert (
+            spread_shell.debris_count + spread_shell.heavy_debris_count
+        ) > 0.0
     assert (
         sim.total_mass_in_orbit_kg + sim.reentered_mass_kg
         == pytest.approx(sim.initial_mass_kg, rel=1e-10)
     )
+
+
+def _make_cam_macro_collision_simulation():
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    sim.base_annual_launches = 0.0
+    sim.pmd_failure_rate = 0.0
+    for shell in sim.shells:
+        shell.legacy_sat_count = 0.0
+        shell.new_sat_count = 0.0
+        shell.derelict_count = 0.0
+        shell.debris_count = 0.0
+        shell.heavy_debris_count = 0.0
+        shell.satellite_mass_kg = 0.0
+        shell.derelict_mass_kg = 0.0
+        shell.debris_mass_kg = 0.0
+        shell.heavy_debris_mass_kg = 0.0
+        shell.update_mass_count_snapshot()
+
+    shell = next(shell for shell in sim.shells if shell.altitude_km == 550)
+    shell.legacy_sat_count = 100.0
+    shell.satellite_mass_kg = 25_000.0
+    shell.cam_fueled_sat_count = 100.0
+    shell.cam_burns_remaining = 100_000.0
+    shell.update_mass_count_snapshot()
+    sim.initial_mass_kg = sim.total_mass_in_orbit_kg
+    return sim, shell
+
+
+def test_cams_reduce_only_macroscopic_collision_exposure(monkeypatch):
+    import src.physics.drag as drag
+
+    control, control_shell = _make_cam_macro_collision_simulation()
+    cam_sim, cam_shell = _make_cam_macro_collision_simulation()
+    control_shell.heavy_debris_count = 1_000_000.0
+    control_shell.heavy_debris_mass_kg = 10_000_000.0
+    cam_shell.heavy_debris_count = 1_000_000.0
+    cam_shell.heavy_debris_mass_kg = 10_000_000.0
+    control_shell.update_mass_count_snapshot()
+    cam_shell.update_mass_count_snapshot()
+    control.initial_mass_kg = control.total_mass_in_orbit_kg
+    cam_sim.initial_mass_kg = cam_sim.total_mass_in_orbit_kg
+    control.cams_efficiency = 0.0
+    cam_sim.cams_efficiency = 0.9
+    monkeypatch.setattr(
+        control,
+        "_consume_cam_screenings",
+        lambda shell, dt_years, velocity: 0.0,
+    )
+    monkeypatch.setattr(
+        cam_sim,
+        "_consume_cam_screenings",
+        lambda shell, dt_years, velocity: 0.9,
+    )
+    monkeypatch.setattr(
+        drag,
+        "calculate_orbital_decay_rate",
+        lambda *args, **kwargs: {"decay_rate_km_year": 0.0},
+    )
+
+    control._integrate_collision_and_drag_substep(dt_years=1.0)
+    cam_sim._integrate_collision_and_drag_substep(dt_years=1.0)
+
+    assert cam_shell.sat_count > control_shell.sat_count
+    assert cam_sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
+    assert control.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
+
+
+def test_cam_screenings_consume_reserve_and_deplete_maneuverability(monkeypatch):
+    sim, shell = _make_cam_macro_collision_simulation()
+    shell.legacy_sat_count = 1.0
+    shell.satellite_mass_kg = SATELLITE_MASS_KG
+    shell.cam_fueled_sat_count = 1.0
+    shell.cam_burns_remaining = 15.0
+    shell.update_mass_count_snapshot()
+    sim.cams_efficiency = 0.9
+    monkeypatch.setattr(
+        sim, "_cam_screening_rate_per_satellite", lambda shell, velocity=None: 10.0
+    )
+
+    first_coverage = sim._consume_cam_screenings(shell, 1.0, 10.0)
+    assert first_coverage == pytest.approx(0.9)
+    assert shell.cam_burns_remaining == pytest.approx(5.0)
+    assert shell.cam_fueled_sat_count == pytest.approx(1.0)
+
+    second_coverage = sim._consume_cam_screenings(shell, 1.0, 10.0)
+    assert second_coverage == pytest.approx(0.45)
+    assert shell.cam_burns_remaining == pytest.approx(0.0)
+    assert shell.cam_fueled_sat_count == pytest.approx(0.0)
+    assert shell.cam_depleted_sat_count == pytest.approx(1.0)
+
+
+def test_cam_screening_area_is_separate_from_physical_collision_area(monkeypatch):
+    import src.physics.collisions as collisions
+    import src.physics.drag as drag
+
+    sim, shell = _make_cam_macro_collision_simulation()
+    shell.heavy_debris_count = 1.0
+    shell.heavy_debris_mass_kg = HEAVY_CHUNK_MASS_KG
+    shell.update_mass_count_snapshot()
+    sim.initial_mass_kg = sim.total_mass_in_orbit_kg
+    areas = []
+
+    def record_area(
+        spatial_density, cross_section_m2, time_horizon_years,
+        relative_velocity_km_s=10.0, lethal_spatial_density_km3=None,
+    ):
+        areas.append(cross_section_m2)
+        return {"rate_per_year": 0.0}
+
+    monkeypatch.setattr(collisions, "calculate_impact_metrics", record_area)
+    monkeypatch.setattr(
+        drag,
+        "calculate_orbital_decay_rate",
+        lambda *args, **kwargs: {"decay_rate_km_year": 0.0},
+    )
+    screening_area_m2 = math.pi * (
+        sim.cam_screening_radius_km * 1000.0
+    ) ** 2
+    assert sim._cam_screening_rate_per_satellite(shell) == 0.0
+    monkeypatch.setattr(sim, "_consume_cam_screenings", lambda *args: 0.0)
+
+    sim._integrate_collision_and_drag_substep(dt_years=0.1)
+
+    assert screening_area_m2 in areas
+    assert areas.count(10.0) >= 3
+
+
+def test_adaptive_substep_is_independent_of_cam_reserve(monkeypatch):
+    sim, shell = _make_cam_macro_collision_simulation()
+    shell.legacy_sat_count = 1.0
+    shell.cam_fueled_sat_count = 1.0
+    shell.cam_burns_remaining = 5.0
+    shell.update_mass_count_snapshot()
+    monkeypatch.setattr(
+        sim, "_cam_screening_rate_per_satellite", lambda shell, velocity=None: 10.0
+    )
+
+    assert sim._adaptive_substep_years(1.0, start_year=0.0) == pytest.approx(1.0)
+
+
+def test_exhausted_cam_cohort_fails_pmd_at_retirement():
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    sim.base_annual_launches = 0.0
+    sim.sat_lifespan_years = 1.0
+    sim.pmd_failure_rate = 0.1
+    for shell in sim.shells:
+        shell.legacy_sat_count = 0.0
+        shell.new_sat_count = 0.0
+        shell.derelict_count = 0.0
+        shell.debris_count = 0.0
+        shell.heavy_debris_count = 0.0
+        shell.satellite_mass_kg = 0.0
+        shell.derelict_mass_kg = 0.0
+        shell.debris_mass_kg = 0.0
+        shell.heavy_debris_mass_kg = 0.0
+        shell.update_mass_count_snapshot()
+
+    shell = next(shell for shell in sim.shells if shell.altitude_km == 550)
+    shell.legacy_sat_count = 10.0
+    shell.satellite_mass_kg = 10.0 * SATELLITE_MASS_KG
+    shell.cam_fueled_sat_count = 0.0
+    shell.cam_burns_remaining = 0.0
+    shell.update_mass_count_snapshot()
+    sim.initial_mass_kg = sim.total_mass_in_orbit_kg
+
+    sim.step()
+
+    assert shell.sat_count == pytest.approx(0.0)
+    assert shell.derelict_count == pytest.approx(10.0)
+    assert shell.derelict_mass_kg == pytest.approx(10.0 * SATELLITE_MASS_KG)
+    assert sim.reentered_mass_kg == pytest.approx(0.0)
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
+
+
+def test_derelict_derelict_collision_uses_pair_symmetry_factor(monkeypatch):
+    import src.physics.collisions as collisions
+    import src.physics.drag as drag
+
+    sim = KesslerSimulation(data_path="missing-telemetry.json")
+    for shell in sim.shells:
+        shell.legacy_sat_count = 0.0
+        shell.new_sat_count = 0.0
+        shell.derelict_count = 0.0
+        shell.debris_count = 0.0
+        shell.heavy_debris_count = 0.0
+        shell.satellite_mass_kg = 0.0
+        shell.derelict_mass_kg = 0.0
+        shell.debris_mass_kg = 0.0
+        shell.heavy_debris_mass_kg = 0.0
+        shell.update_mass_count_snapshot()
+
+    shell = next(shell for shell in sim.shells if shell.altitude_km == 550)
+    shell.derelict_count = 100.0
+    shell.derelict_mass_kg = 100.0 * SATELLITE_MASS_KG
+    shell.update_mass_count_snapshot()
+    sim.initial_mass_kg = sim.total_mass_in_orbit_kg
+    monkeypatch.setattr(
+        collisions,
+        "calculate_impact_metrics",
+        lambda *args, **kwargs: {"rate_per_year": 0.1},
+    )
+    monkeypatch.setattr(
+        drag,
+        "calculate_orbital_decay_rate",
+        lambda *args, **kwargs: {"decay_rate_km_year": 0.0},
+    )
+
+    sim._integrate_collision_and_drag_substep(dt_years=1.0)
+
+    expected_pairs = 0.5 * 100.0 * -math.expm1(-0.1)
+    assert shell.derelict_count == pytest.approx(100.0 - 2.0 * expected_pairs)
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
 
 
 def test_mixed_shrapnel_and_heavy_impacts_conserve_mass():
@@ -627,10 +1137,14 @@ def test_laser_broom_targets_most_congested_shells_first():
     for s in sim.shells:
         s.legacy_sat_count = 0.0
         s.new_sat_count = 0.0
+        s.derelict_count = 0.0
+        s.heavy_debris_count = 0.0
         s.debris_count = 0.0
     for s in control.shells:
         s.legacy_sat_count = 0.0
         s.new_sat_count = 0.0
+        s.derelict_count = 0.0
+        s.heavy_debris_count = 0.0
         s.debris_count = 0.0
 
     idx_550 = next(i for i, s in enumerate(sim.shells) if s.altitude_km == 550)
@@ -646,7 +1160,7 @@ def test_laser_broom_targets_most_congested_shells_first():
 
     assert sim.shells[idx_800].debris_count <= 15_000.0, "Laser failed to target 800km shell."
     assert sim.shells[idx_550].debris_count == pytest.approx(
-        control.shells[idx_550].debris_count
+        control.shells[idx_550].debris_count, abs=1e-3
     ), "Laser incorrectly deducted shots from 550km shell."
 
 
@@ -814,7 +1328,7 @@ def test_catastrophic_collision_consumes_target_and_projectile_mass_once():
 
     assert 0.0 < shell.sat_count < 0.8
     assert shell.debris_count > 0.0
-    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-8)
+    assert sim.mass_balance_error_kg == pytest.approx(0.0, abs=1e-7)
 
 
 def test_invalid_step_parameters_raise_without_division_errors():

@@ -27,3 +27,30 @@ derelict spatial density, a 10 m^2 reference cross-section, and the altitude-
 dependent relative-velocity model. The dashboard reports launches diverted in
 the final simulated year; its viability-chart altitude selector is independent
 of launch routing.
+
+Atmospheric density and orbital decay vary with an illustrative 11-year solar
+cycle. The mean density profile is scaled by a sinusoidal multiplier ranging
+from 0.5 at solar minimum to 1.5 at solar maximum, with solar maximum at
+simulation year 0 and every 11 years afterward. Drag is evaluated at each
+adaptive substep's midpoint; the step-size bound accounts for the maximum
+solar-cycle density over the candidate interval. Solar maxima are highlighted
+on the debris inventory and mission-viability charts. Debris mass transported
+downward remains accounted for, with material leaving the lowest modeled shell
+recorded as reentered mass.
+
+Collision ejecta is spread across the impact shell and its two neighbors in
+each direction using a discrete Gaussian-inspired kernel: 60% remains in the
+impact shell, 15% goes to each adjacent shell, and 5% goes to each shell two
+steps away. Ejecta below the lowest modeled shell is recorded as reentered;
+ejecta above the highest shell is retained in the top shell. Shrapnel and heavy
+chunks use the same normalized weights so the spread preserves mass.
+
+Active satellites use collision-avoidance maneuvers (CAMs) against tracked
+heavy debris and derelicts, but not against 1 cm shrapnel. CAM warnings are
+screened within a configurable radius (0.75 km by default), distinct from the
+10 m^2 physical collision area. The default 90% avoidance efficiency uses a
+finite reserve of 75 burns per satellite. Exhausted satellites remain active
+but cannot maneuver; at retirement they fail PMD and become derelicts. Reserve
+and screening are represented at aggregate shell-cohort level, and the burn
+counter does not change modeled satellite mass. Derelict-derelict collisions
+use a one-half symmetry factor to avoid counting identical-species pairs twice.

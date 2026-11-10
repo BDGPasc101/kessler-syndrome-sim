@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 import math
 import sys
 
@@ -9,15 +9,22 @@ from src.physics.breakup import (
     SHRAPNEL_CROSS_SECTION_M2,
     SHRAPNEL_MASS_KG,
     WHIPPLE_SHIELD_LETHAL_ENERGY_J,
+    EJECTA_SHELL_SPREAD_WEIGHTS,
     calculate_kinetic_energy_j,
+    validate_ejecta_shell_spread_weights,
 )
 
 MU = 398600.4418
 EARTH_RADIUS_KM = 6378.137
 SATELLITE_MASS_KG = 250.0
+SATELLITE_CROSS_SECTION_M2 = 10.0
+DEFAULT_CAMS_EFFICIENCY = 0.90
+DEFAULT_CAM_BURNS_PER_SATELLITE = 75.0
+DEFAULT_CAM_SCREENING_RADIUS_KM = 0.75
 FRAGMENT_MASS_KG = SHRAPNEL_MASS_KG
 MAX_DRAG_DISPLACEMENT_KM = 10.0
 MAX_COLLISION_EXPOSURE = 0.1
+MAX_SUBSTEPS_PER_YEAR = 25
 ROUTING_REFERENCE_CROSS_SECTION_M2 = 10.0
 HIGHWAY_ALTITUDE_KM = 450.0
 HIGHWAY_BASE_ALLOCATION = 0.60
@@ -41,6 +48,9 @@ class TransitingDebrisBatch:
     transit_duration_years: float = 2.0
     initial_count: float = 0.0
     mass_kg: Optional[float] = None
+    _occupancy_cache: Dict[float, float] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self):
         if self.initial_count == 0.0:
@@ -54,17 +64,23 @@ class TransitingDebrisBatch:
 
     def occupancy_fraction(self, shell_altitude_km: float) -> float:
         """Fraction of orbit spent within a specific 50km shell."""
+        cached_fraction = self._occupancy_cache.get(shell_altitude_km)
+        if cached_fraction is not None:
+            return cached_fraction
+
         perigee_altitude_km = 200.0
         if (
             shell_altitude_km < 400.0
             or not math.isfinite(shell_altitude_km)
             or not math.isfinite(self.origin_altitude_km)
         ):
+            self._occupancy_cache[shell_altitude_km] = 0.0
             return 0.0
 
         perigee_radius_km = EARTH_RADIUS_KM + perigee_altitude_km
         apogee_radius_km = EARTH_RADIUS_KM + self.origin_altitude_km
         if apogee_radius_km <= perigee_radius_km:
+            self._occupancy_cache[shell_altitude_km] = 0.0
             return 0.0
 
         shell_inner_radius_km = max(
@@ -76,6 +92,7 @@ class TransitingDebrisBatch:
             EARTH_RADIUS_KM + shell_altitude_km + 25.0,
         )
         if shell_inner_radius_km >= shell_outer_radius_km:
+            self._occupancy_cache[shell_altitude_km] = 0.0
             return 0.0
 
         semi_major_axis_km = (perigee_radius_km + apogee_radius_km) / 2.0
@@ -84,6 +101,7 @@ class TransitingDebrisBatch:
             / (apogee_radius_km + perigee_radius_km)
         )
         if eccentricity <= 0.0:
+            self._occupancy_cache[shell_altitude_km] = 0.0
             return 0.0
 
         def mean_anomaly(radius_km: float) -> float:
@@ -95,10 +113,12 @@ class TransitingDebrisBatch:
             )
             return eccentric_anomaly - eccentricity * math.sin(eccentric_anomaly)
 
-        return (
+        occupancy = (
             mean_anomaly(shell_outer_radius_km)
             - mean_anomaly(shell_inner_radius_km)
         ) / math.pi
+        self._occupancy_cache[shell_altitude_km] = occupancy
+        return occupancy
 
 
 class OrbitalShell:
@@ -122,12 +142,28 @@ class OrbitalShell:
             self.heavy_debris_count * HEAVY_CHUNK_MASS_KG
         )
         self.collision_lifespan_damage_years = 0.0
+        self.cam_burns_per_satellite = DEFAULT_CAM_BURNS_PER_SATELLITE
+        self.cam_fueled_sat_count = self.sat_count
+        self.cam_burns_remaining = (
+            self.sat_count * self.cam_burns_per_satellite
+        )
+        self._cam_sat_count_snapshot = self.sat_count
         self._mass_count_snapshot = self._get_count_snapshot()
 
         # Shell volume: V = 4/3 * pi * (r_outer^3 - r_inner^3)
-        r_inner = EARTH_RADIUS_KM + self.altitude_km - 25.0
-        r_outer = EARTH_RADIUS_KM + self.altitude_km + 25.0
-        self.volume_km3 = (4.0 / 3.0) * math.pi * (r_outer**3 - r_inner**3)
+        self.inner_radius_km = EARTH_RADIUS_KM + self.altitude_km - 25.0
+        self.outer_radius_km = EARTH_RADIUS_KM + self.altitude_km + 25.0
+        self.volume_km3 = (4.0 / 3.0) * math.pi * (
+            self.outer_radius_km**3 - self.inner_radius_km**3
+        )
+        self.orbital_radius_km = EARTH_RADIUS_KM + self.altitude_km
+        self.circular_orbital_velocity_km_s = math.sqrt(
+            MU / self.orbital_radius_km
+        )
+        from src.physics.collisions import calculate_relative_velocity_km_s
+        self.relative_velocity_km_s = calculate_relative_velocity_km_s(
+            self.altitude_km
+        )
 
     @property
     def sat_count(self) -> float:
@@ -158,6 +194,7 @@ class OrbitalShell:
             return 0.0
 
         old_mass = self.total_mass_kg
+        self.reconcile_cam_satellite_count(self._cam_sat_count_snapshot)
         self.satellite_mass_kg = self.sat_count * SATELLITE_MASS_KG
         self.derelict_mass_kg = self.derelict_count * SATELLITE_MASS_KG
         self.debris_mass_kg = self.debris_count * FRAGMENT_MASS_KG
@@ -169,6 +206,41 @@ class OrbitalShell:
 
     def update_mass_count_snapshot(self):
         self._mass_count_snapshot = self._get_count_snapshot()
+        self._cam_sat_count_snapshot = self.sat_count
+
+    @property
+    def cam_depleted_sat_count(self) -> float:
+        return max(0.0, self.sat_count - self.cam_fueled_sat_count)
+
+    def reconcile_cam_satellite_count(self, previous_count: float) -> None:
+        current_count = self.sat_count
+        if current_count > previous_count:
+            added = current_count - previous_count
+            if self.cam_burns_per_satellite > 0.0:
+                self.cam_fueled_sat_count += added
+                self.cam_burns_remaining += (
+                    added * self.cam_burns_per_satellite
+                )
+        elif current_count < previous_count and previous_count > 0.0:
+            retention_fraction = current_count / previous_count
+            self.cam_fueled_sat_count *= retention_fraction
+            self.cam_burns_remaining *= retention_fraction
+
+        self.cam_fueled_sat_count = min(
+            current_count, max(0.0, self.cam_fueled_sat_count)
+        )
+        if self.cam_burns_remaining <= 1e-12:
+            self.cam_burns_remaining = 0.0
+            self.cam_fueled_sat_count = 0.0
+        self._cam_sat_count_snapshot = current_count
+
+    def add_cam_fueled_satellites(self, count: float) -> None:
+        if not math.isfinite(count) or count < 0.0:
+            raise ValueError("Added CAM cohort must be finite and nonnegative.")
+        if self.cam_burns_per_satellite > 0.0:
+            self.cam_fueled_sat_count += count
+            self.cam_burns_remaining += count * self.cam_burns_per_satellite
+        self._cam_sat_count_snapshot = self.sat_count
 
 
 class KesslerSimulation:
@@ -181,6 +253,9 @@ class KesslerSimulation:
         self.launch_growth_rate: float = 0.05
         self.sat_lifespan_years: float = 5.0
         self.pmd_failure_rate: float = 0.10    # 10% fail to de-orbit
+        self.cams_efficiency: float = DEFAULT_CAMS_EFFICIENCY
+        self.cam_burns_per_satellite: float = DEFAULT_CAM_BURNS_PER_SATELLITE
+        self.cam_screening_radius_km: float = DEFAULT_CAM_SCREENING_RADIUS_KM
         self.whipple_shield_lethal_energy_j = WHIPPLE_SHIELD_LETHAL_ENERGY_J
         self.shield_coverage_fraction: float = 0.3
         self.satellite_lifespan_damage_years_per_absorbed_impact = 0.1
@@ -191,9 +266,20 @@ class KesslerSimulation:
         
         self.current_year: float = 0.0
         self._load_telemetry(data_path)
+        self.set_cam_burns_per_satellite(self.cam_burns_per_satellite)
         self.initial_mass_kg = sum(shell.total_mass_kg for shell in self.shells)
         self.launched_mass_kg = 0.0
         self.reentered_mass_kg = 0.0
+
+    def set_cam_burns_per_satellite(self, burns: float) -> None:
+        if not math.isfinite(burns) or burns < 0.0:
+            raise ValueError("CAM burns per satellite must be finite and nonnegative.")
+        self.cam_burns_per_satellite = burns
+        for shell in self.shells:
+            shell.cam_burns_per_satellite = burns
+            shell.cam_burns_remaining = shell.cam_fueled_sat_count * burns
+            if burns == 0.0:
+                shell.cam_fueled_sat_count = 0.0
 
     def _load_telemetry(self, path: str):
         import os, json
@@ -266,6 +352,9 @@ class KesslerSimulation:
             "dt_years": dt_years,
             "sat_lifespan_years": self.sat_lifespan_years,
             "pmd_failure_rate": self.pmd_failure_rate,
+            "cams_efficiency": self.cams_efficiency,
+            "cam_burns_per_satellite": self.cam_burns_per_satellite,
+            "cam_screening_radius_km": self.cam_screening_radius_km,
             "whipple_shield_lethal_energy_j": self.whipple_shield_lethal_energy_j,
             "shield_coverage_fraction": self.shield_coverage_fraction,
             "satellite_lifespan_damage_years_per_absorbed_impact":
@@ -285,6 +374,12 @@ class KesslerSimulation:
             raise ValueError("sat_lifespan_years must be greater than zero.")
         if not 0.0 <= self.pmd_failure_rate <= 1.0:
             raise ValueError("pmd_failure_rate must be between zero and one.")
+        if not 0.0 <= self.cams_efficiency <= 1.0:
+            raise ValueError("cams_efficiency must be between zero and one.")
+        if self.cam_burns_per_satellite < 0.0:
+            raise ValueError("cam_burns_per_satellite must not be negative.")
+        if self.cam_screening_radius_km <= 0.0:
+            raise ValueError("cam_screening_radius_km must be greater than zero.")
         if self.whipple_shield_lethal_energy_j <= 0:
             raise ValueError("whipple_shield_lethal_energy_j must be greater than zero.")
         if not 0.0 <= self.shield_coverage_fraction <= 1.0:
@@ -314,6 +409,16 @@ class KesslerSimulation:
                 or batch.mass_kg < 0
             ):
                 raise ValueError("Transit batches must have finite, nonnegative state and positive durations.")
+        for shell in self.shells:
+            if (
+                not math.isfinite(shell.cam_fueled_sat_count)
+                or not math.isfinite(shell.cam_burns_remaining)
+                or shell.cam_fueled_sat_count < 0.0
+                or shell.cam_burns_remaining < 0.0
+            ):
+                raise ValueError(
+                    "CAM cohort reserves must be finite and nonnegative."
+                )
         if not math.isfinite(self.current_year) or self.current_year < 0:
             raise ValueError("current_year must be finite and nonnegative.")
 
@@ -345,10 +450,7 @@ class KesslerSimulation:
         if not self.enable_dynamic_highway_routing:
             return 0.0
 
-        from src.physics.collisions import (
-            calculate_impact_metrics,
-            calculate_relative_velocity_km_s,
-        )
+        from src.physics.collisions import calculate_impact_metrics
 
         highway_shell = next(
             (shell for shell in self.shells
@@ -365,7 +467,7 @@ class KesslerSimulation:
             lethal_density,
             ROUTING_REFERENCE_CROSS_SECTION_M2,
             self.sat_lifespan_years + 5.0,
-            calculate_relative_velocity_km_s(HIGHWAY_ALTITUDE_KM),
+            highway_shell.relative_velocity_km_s,
             lethal_spatial_density_km3=lethal_density,
         )["probability_of_catastrophic_breach"]
         excess_risk = max(0.0, risk - (1.0 - HIGHWAY_SURVIVAL_THRESHOLD))
@@ -378,8 +480,10 @@ class KesslerSimulation:
         projectile_type: str = "all",
     ) -> tuple[float, float]:
         """Remove consumed shrapnel or heavy chunks from this shell and transit."""
-        if projectile_type not in {"all", "shrapnel", "heavy"}:
-            raise ValueError("projectile_type must be all, shrapnel, or heavy.")
+        if projectile_type not in {"all", "shrapnel", "heavy", "derelict"}:
+            raise ValueError(
+                "projectile_type must be all, shrapnel, heavy, or derelict."
+            )
         remaining = amount
         mass_consumed = 0.0
         if projectile_type in {"all", "shrapnel"}:
@@ -419,18 +523,131 @@ class KesslerSimulation:
             shell.heavy_debris_mass_kg -= heavy_consumed * HEAVY_CHUNK_MASS_KG
             remaining -= heavy_consumed
             mass_consumed += heavy_consumed * HEAVY_CHUNK_MASS_KG
+        if projectile_type == "derelict":
+            derelict_consumed = min(
+                remaining,
+                shell.derelict_count,
+                shell.derelict_mass_kg / SATELLITE_MASS_KG,
+            )
+            shell.derelict_count -= derelict_consumed
+            derelict_mass_consumed = derelict_consumed * SATELLITE_MASS_KG
+            shell.derelict_mass_kg -= derelict_mass_consumed
+            remaining -= derelict_consumed
+            mass_consumed += derelict_mass_consumed
         return amount - remaining, mass_consumed
 
-    def _adaptive_substep_years(self, remaining_years: float) -> float:
-        """Choose a step that resolves shell-to-shell drag and collision exposure."""
-        from src.physics.collisions import (
-            calculate_impact_metrics,
-            calculate_relative_velocity_km_s,
+    def _cam_screening_rate_per_satellite(
+        self, shell: OrbitalShell, relative_velocity_km_s: Optional[float] = None
+    ) -> float:
+        from src.physics.collisions import calculate_impact_metrics
+
+        if relative_velocity_km_s is None:
+            relative_velocity_km_s = shell.relative_velocity_km_s
+        screening_area_m2 = math.pi * (
+            self.cam_screening_radius_km * 1000.0
+        ) ** 2
+        macro_density = (
+            shell.heavy_debris_count + shell.derelict_count
+        ) / shell.volume_km3
+        return calculate_impact_metrics(
+            macro_density,
+            screening_area_m2,
+            1.0,
+            relative_velocity_km_s,
+        )["rate_per_year"]
+
+    def _consume_cam_screenings(
+        self, shell: OrbitalShell, dt_years: float, relative_velocity_km_s: float
+    ) -> float:
+        """Spend reserve on screened conjunctions and return effective CAM coverage."""
+        active_satellites = shell.sat_count
+        fueled_satellites = min(
+            active_satellites, shell.cam_fueled_sat_count
         )
-        from src.physics.drag import calculate_orbital_decay_rate
+        if (
+            active_satellites <= 0.0
+            or fueled_satellites <= 0.0
+            or shell.cam_burns_remaining <= 0.0
+            or self.cams_efficiency <= 0.0
+        ):
+            return 0.0
+
+        screening_rate = self._cam_screening_rate_per_satellite(
+            shell, relative_velocity_km_s
+        )
+        requested_burns = (
+            screening_rate * dt_years * fueled_satellites
+        )
+        if requested_burns <= 0.0:
+            return 0.0
+
+        covered_fraction = min(
+            1.0, shell.cam_burns_remaining / requested_burns
+        )
+        effective_coverage = (
+            self.cams_efficiency
+            * fueled_satellites
+            / active_satellites
+            * covered_fraction
+        )
+        shell.cam_burns_remaining = max(
+            0.0, shell.cam_burns_remaining - requested_burns
+        )
+        if shell.cam_burns_remaining <= 1e-12:
+            shell.cam_burns_remaining = 0.0
+            shell.cam_fueled_sat_count = 0.0
+        return effective_coverage
+
+    def _deposit_collision_ejecta(
+        self, impact_shell: OrbitalShell, events: float, breakup_data: dict
+    ) -> None:
+        """Spread collision products into neighboring shells or the reentry sink."""
+        if not math.isfinite(events) or events < 0.0:
+            raise ValueError("Collision event count must be finite and nonnegative.")
+        validate_ejecta_shell_spread_weights()
+        try:
+            impact_index = self.shells.index(impact_shell)
+        except ValueError as exc:
+            raise ValueError("Impact shell must belong to this simulation.") from exc
+
+        shrapnel_count = events * breakup_data["shrapnel_count"]
+        shrapnel_mass = events * (
+            breakup_data["shrapnel_mass_kg"] + breakup_data["untracked_mass_kg"]
+        )
+        heavy_count = events * breakup_data["heavy_chunk_count"]
+        heavy_mass = events * breakup_data["heavy_chunk_mass_kg"]
+
+        for shell_offset, weight in EJECTA_SHELL_SPREAD_WEIGHTS:
+            destination_index = impact_index + shell_offset
+            if destination_index < 0:
+                self.reentered_mass_kg += weight * (
+                    shrapnel_mass + heavy_mass
+                )
+                continue
+
+            destination = self.shells[min(destination_index, len(self.shells) - 1)]
+            destination.debris_count += weight * shrapnel_count
+            destination.debris_mass_kg += weight * shrapnel_mass
+            destination.heavy_debris_count += weight * heavy_count
+            destination.heavy_debris_mass_kg += weight * heavy_mass
+
+    def _adaptive_substep_years(
+        self, remaining_years: float, start_year: Optional[float] = None
+    ) -> float:
+        """Choose a step that resolves shell-to-shell drag and collision exposure."""
+        from src.physics.collisions import calculate_impact_metrics
+        from src.physics.drag import (
+            calculate_orbital_decay_rate,
+            maximum_solar_cycle_density_multiplier,
+        )
 
         max_substep_years = remaining_years
         max_collision_rate = 0.0
+        if start_year is None:
+            start_year = self.current_year
+        maximum_density_multiplier = maximum_solar_cycle_density_multiplier(
+            start_year, remaining_years
+        )
 
         for shell in self.shells:
             transiting_in_shell = self.get_transiting_debris_in_shell(
@@ -441,6 +658,7 @@ class KesslerSimulation:
                     shell.altitude_km,
                     mass_kg=FRAGMENT_MASS_KG,
                     cross_section_m2=SHRAPNEL_CROSS_SECTION_M2,
+                    density_multiplier=maximum_density_multiplier,
                 )["decay_rate_km_year"]
                 if fragment_rate > 0:
                     max_substep_years = min(
@@ -452,6 +670,7 @@ class KesslerSimulation:
                     shell.altitude_km,
                     mass_kg=HEAVY_CHUNK_MASS_KG,
                     cross_section_m2=HEAVY_CHUNK_CROSS_SECTION_M2,
+                    density_multiplier=maximum_density_multiplier,
                 )["decay_rate_km_year"]
                 if heavy_rate > 0:
                     max_substep_years = min(
@@ -460,7 +679,10 @@ class KesslerSimulation:
                     )
             if shell.derelict_count > 0:
                 derelict_rate = calculate_orbital_decay_rate(
-                    shell.altitude_km, mass_kg=250.0, cross_section_m2=5.0
+                    shell.altitude_km,
+                    mass_kg=250.0,
+                    cross_section_m2=5.0,
+                    density_multiplier=maximum_density_multiplier,
                 )["decay_rate_km_year"]
                 max_substep_years = min(
                     max_substep_years,
@@ -473,14 +695,11 @@ class KesslerSimulation:
                 + transiting_in_shell
                 + shell.derelict_count
             )
-            relative_velocity_km_s = calculate_relative_velocity_km_s(
-                shell.altitude_km
-            )
             impact_metrics = calculate_impact_metrics(
                 effective_debris / shell.volume_km3,
-                5.0,
+                SATELLITE_CROSS_SECTION_M2,
                 remaining_years,
-                relative_velocity_km_s,
+                shell.relative_velocity_km_s,
             )
             max_collision_rate = max(
                 max_collision_rate, impact_metrics["rate_per_year"]
@@ -496,13 +715,19 @@ class KesslerSimulation:
             raise ValueError("Adaptive integration produced an invalid substep.")
         return max_substep_years
 
-    def _integrate_collision_and_drag_substep(self, dt_years: float):
-        from src.physics.collisions import (
-            calculate_impact_metrics,
-            calculate_relative_velocity_km_s,
+    def _integrate_collision_and_drag_substep(
+        self, dt_years: float, simulation_year: Optional[float] = None
+    ):
+        from src.physics.collisions import calculate_impact_metrics
+        from src.physics.drag import (
+            calculate_orbital_decay_rate,
+            solar_cycle_density_multiplier,
         )
-        from src.physics.drag import calculate_orbital_decay_rate
         from src.physics.breakup import calculate_breakup_fragments
+
+        if simulation_year is None:
+            simulation_year = self.current_year + dt_years / 2.0
+        density_multiplier = solar_cycle_density_multiplier(simulation_year)
 
         downward_debris_flux = 0.0
         downward_debris_mass_flux = 0.0
@@ -516,18 +741,22 @@ class KesslerSimulation:
             transiting_in_shell = self.get_transiting_debris_in_shell(
                 shell.altitude_km
             )
-            relative_velocity_km_s = calculate_relative_velocity_km_s(
-                shell.altitude_km
-            )
+            relative_velocity_km_s = shell.relative_velocity_km_s
             shrapnel_metrics = calculate_impact_metrics(
                 (shell.debris_count + transiting_in_shell) / shell.volume_km3,
-                5.0,
+                SATELLITE_CROSS_SECTION_M2,
                 dt_years,
                 relative_velocity_km_s,
             )
             heavy_metrics = calculate_impact_metrics(
                 shell.heavy_debris_count / shell.volume_km3,
-                5.0,
+                SATELLITE_CROSS_SECTION_M2,
+                dt_years,
+                relative_velocity_km_s,
+            )
+            derelict_metrics = calculate_impact_metrics(
+                shell.derelict_count / shell.volume_km3,
+                SATELLITE_CROSS_SECTION_M2,
                 dt_years,
                 relative_velocity_km_s,
             )
@@ -537,8 +766,17 @@ class KesslerSimulation:
             active_target_mass = shell.satellite_mass_kg
             derelict_target_mass = shell.derelict_mass_kg
             target_capacity = active_targets + derelict_targets
-            raw_shrapnel_events = target_capacity * -math.expm1(
+            cam_coverage = self._consume_cam_screenings(
+                shell, dt_years, relative_velocity_km_s
+            )
+            shrapnel_probability = -math.expm1(
                 -shrapnel_metrics["rate_per_year"] * dt_years
+            )
+            heavy_probability = -math.expm1(
+                -heavy_metrics["rate_per_year"] * dt_years
+            )
+            derelict_probability = -math.expm1(
+                -derelict_metrics["rate_per_year"] * dt_years
             )
             transit_projectiles = sum(
                 min(
@@ -555,16 +793,67 @@ class KesslerSimulation:
                 shell.heavy_debris_count,
                 shell.heavy_debris_mass_kg / HEAVY_CHUNK_MASS_KG,
             )
-            raw_heavy_events = target_capacity * -math.expm1(
-                -heavy_metrics["rate_per_year"] * dt_years
+            derelict_capacity = min(
+                shell.derelict_count,
+                shell.derelict_mass_kg / SATELLITE_MASS_KG,
             )
-            shrapnel_events = min(raw_shrapnel_events, shrapnel_capacity)
-            heavy_events = min(raw_heavy_events, heavy_capacity)
-            requested_events = shrapnel_events + heavy_events
-            if requested_events > target_capacity and requested_events > 0:
-                target_scale = target_capacity / requested_events
-                shrapnel_events *= target_scale
-                heavy_events *= target_scale
+            shrapnel_events = min(
+                target_capacity * shrapnel_probability, shrapnel_capacity
+            )
+            active_fraction = (
+                active_targets / target_capacity if target_capacity > 0 else 0.0
+            )
+            active_shrapnel_events = shrapnel_events * active_fraction
+            derelict_shrapnel_events = (
+                shrapnel_events - active_shrapnel_events
+            )
+            active_heavy_events = (
+                active_targets
+                * heavy_probability
+                * (1.0 - cam_coverage)
+            )
+            derelict_heavy_events = derelict_targets * heavy_probability
+            active_derelict_events = (
+                active_targets
+                * derelict_probability
+                * (1.0 - cam_coverage)
+            )
+            derelict_pair_events = (
+                0.5 * derelict_targets * derelict_probability
+            )
+
+            active_target_events = (
+                active_shrapnel_events
+                + active_heavy_events
+                + active_derelict_events
+            )
+            if active_target_events > active_targets and active_target_events > 0:
+                active_scale = active_targets / active_target_events
+                active_shrapnel_events *= active_scale
+                active_heavy_events *= active_scale
+                active_derelict_events *= active_scale
+
+            derelict_pool_use = (
+                derelict_shrapnel_events
+                + derelict_heavy_events
+                + active_derelict_events
+                + 2.0 * derelict_pair_events
+            )
+            if derelict_pool_use > derelict_capacity and derelict_pool_use > 0:
+                derelict_scale = derelict_capacity / derelict_pool_use
+                derelict_shrapnel_events *= derelict_scale
+                derelict_heavy_events *= derelict_scale
+                active_derelict_events *= derelict_scale
+                derelict_pair_events *= derelict_scale
+
+            heavy_events = active_heavy_events + derelict_heavy_events
+            if heavy_events > heavy_capacity and heavy_events > 0:
+                heavy_scale = heavy_capacity / heavy_events
+                active_heavy_events *= heavy_scale
+                derelict_heavy_events *= heavy_scale
+            shrapnel_events = (
+                active_shrapnel_events + derelict_shrapnel_events
+            )
 
             shrapnel_events, shrapnel_mass_consumed = self._consume_projectiles(
                 shell, shrapnel_events, projectile_type="shrapnel"
@@ -572,24 +861,31 @@ class KesslerSimulation:
             heavy_events, heavy_mass_consumed = self._consume_projectiles(
                 shell, heavy_events, projectile_type="heavy"
             )
+            if heavy_events < active_heavy_events + derelict_heavy_events:
+                heavy_scale = heavy_events / (
+                    active_heavy_events + derelict_heavy_events
+                )
+                active_heavy_events *= heavy_scale
+                derelict_heavy_events *= heavy_scale
+            derelict_events = active_derelict_events + derelict_pair_events
+            derelict_events, derelict_mass_consumed = self._consume_projectiles(
+                shell, derelict_events, projectile_type="derelict"
+            )
+            if derelict_events < active_derelict_events + derelict_pair_events:
+                derelict_scale = (
+                    derelict_events
+                    / (active_derelict_events + derelict_pair_events)
+                )
+                active_derelict_events *= derelict_scale
+                derelict_pair_events *= derelict_scale
 
             if target_capacity > 0:
-                active_target_fraction = active_targets / target_capacity
-                active_shrapnel_events = shrapnel_events * active_target_fraction
-                derelict_shrapnel_events = (
-                    shrapnel_events - active_shrapnel_events
-                )
-                active_heavy_events = heavy_events * active_target_fraction
-                derelict_heavy_events = (
-                    heavy_events - active_heavy_events
-                )
-
                 def apply_collision(
                     target_count: float,
                     target_mass: float,
                     events: float,
                     projectile_mass: float,
-                    projectile_is_heavy: bool,
+                    projectile_is_macroscopic: bool,
                     shielded_target: bool,
                 ):
                     if events <= 0 or target_count <= 0:
@@ -601,7 +897,7 @@ class KesslerSimulation:
                     )
                     if (
                         shielded_target
-                        and not projectile_is_heavy
+                        and not projectile_is_macroscopic
                         and kinetic_energy_j < self.whipple_shield_lethal_energy_j
                     ):
                         shielded_events = (
@@ -628,18 +924,10 @@ class KesslerSimulation:
                         projectile_mass_kg=projectile_mass,
                         impact_velocity_km_s=relative_velocity_km_s,
                         fragment_mass_kg=FRAGMENT_MASS_KG,
-                        force_catastrophic=projectile_is_heavy,
+                        force_catastrophic=projectile_is_macroscopic,
                     )
-                    shell.debris_count += events * breakup_data["shrapnel_count"]
-                    shell.debris_mass_kg += events * (
-                        breakup_data["shrapnel_mass_kg"]
-                        + breakup_data["untracked_mass_kg"]
-                    )
-                    shell.heavy_debris_count += (
-                        events * breakup_data["heavy_chunk_count"]
-                    )
-                    shell.heavy_debris_mass_kg += (
-                        events * breakup_data["heavy_chunk_mass_kg"]
+                    self._deposit_collision_ejecta(
+                        shell, events, breakup_data
                     )
 
                     if breakup_data["is_catastrophic"]:
@@ -660,6 +948,10 @@ class KesslerSimulation:
                     heavy_mass_consumed / heavy_events
                     if heavy_events > 0 else 0.0
                 )
+                derelict_mass_per_projectile = (
+                    derelict_mass_consumed / derelict_events
+                    if derelict_events > 0 else 0.0
+                )
                 active_destroyed = 0.0
                 active_mass_removed = 0.0
                 active_mission_kills = 0.0
@@ -667,7 +959,12 @@ class KesslerSimulation:
                 derelict_destroyed = 0.0
                 derelict_mass_removed = 0.0
 
-                for events, projectile_mass, is_heavy, targets_are_active in (
+                for (
+                    events,
+                    projectile_mass,
+                    projectile_is_macroscopic,
+                    targets_are_active,
+                ) in (
                     (
                         active_shrapnel_events,
                         shrapnel_mass_per_projectile,
@@ -692,6 +989,18 @@ class KesslerSimulation:
                         True,
                         False,
                     ),
+                    (
+                        active_derelict_events,
+                        derelict_mass_per_projectile,
+                        True,
+                        True,
+                    ),
+                    (
+                        derelict_pair_events,
+                        derelict_mass_per_projectile,
+                        True,
+                        False,
+                    ),
                 ):
                     target_count = active_targets if targets_are_active else derelict_targets
                     target_mass = (
@@ -710,7 +1019,7 @@ class KesslerSimulation:
                         target_mass,
                         events,
                         projectile_mass,
-                        is_heavy,
+                        projectile_is_macroscopic,
                         targets_are_active,
                     )
                     if targets_are_active:
@@ -740,11 +1049,13 @@ class KesslerSimulation:
                 )
                 shell.derelict_count -= derelict_destroyed
                 shell.derelict_mass_kg -= derelict_mass_removed
+                shell.reconcile_cam_satellite_count(active_targets)
 
             fragment_rate = calculate_orbital_decay_rate(
                 shell.altitude_km,
                 mass_kg=FRAGMENT_MASS_KG,
                 cross_section_m2=SHRAPNEL_CROSS_SECTION_M2,
+                density_multiplier=density_multiplier,
             )["decay_rate_km_year"]
             decay_frac_frag = -math.expm1(
                 -(fragment_rate * dt_years) / 50.0
@@ -758,6 +1069,7 @@ class KesslerSimulation:
                 shell.altitude_km,
                 mass_kg=HEAVY_CHUNK_MASS_KG,
                 cross_section_m2=HEAVY_CHUNK_CROSS_SECTION_M2,
+                density_multiplier=density_multiplier,
             )["decay_rate_km_year"]
             decay_frac_heavy = -math.expm1(
                 -(heavy_rate * dt_years) / 50.0
@@ -772,7 +1084,10 @@ class KesslerSimulation:
             shell.heavy_debris_mass_kg -= heavy_debris_mass_leaving
 
             derelict_rate = calculate_orbital_decay_rate(
-                shell.altitude_km, mass_kg=250.0, cross_section_m2=5.0
+                shell.altitude_km,
+                mass_kg=250.0,
+                cross_section_m2=5.0,
+                density_multiplier=density_multiplier,
             )["decay_rate_km_year"]
             decay_frac_derelict = -math.expm1(
                 -(derelict_rate * dt_years) / 50.0
@@ -877,16 +1192,33 @@ class KesslerSimulation:
 
         # 3. Integrate collision and drag changes without altering outer-step events.
         elapsed_years = 0.0
+        max_substeps = max(
+            1, math.floor(dt_years * MAX_SUBSTEPS_PER_YEAR + 1e-12)
+        )
+        substeps_taken = 0
         while elapsed_years < dt_years:
             remaining_years = dt_years - elapsed_years
-            substep_years = self._adaptive_substep_years(remaining_years)
+            substep_start_year = self.current_year + elapsed_years
+            adaptive_step_years = self._adaptive_substep_years(
+                remaining_years, substep_start_year
+            )
+            remaining_slots = max_substeps - substeps_taken
+            minimum_step_years = remaining_years / remaining_slots
+            substep_years = min(
+                remaining_years,
+                max(adaptive_step_years, minimum_step_years),
+            )
             if elapsed_years + substep_years == elapsed_years:
                 raise ValueError("Adaptive integration step is below time precision.")
-            self._integrate_collision_and_drag_substep(substep_years)
+            self._integrate_collision_and_drag_substep(
+                substep_years,
+                substep_start_year + substep_years / 2.0,
+            )
             if substep_years == remaining_years:
                 elapsed_years = dt_years
             else:
                 elapsed_years += substep_years
+            substeps_taken += 1
 
         # 4. Satellite lifespan turnover remains once per requested step.
         for shell in self.shells:
@@ -901,6 +1233,8 @@ class KesslerSimulation:
                 dt_years / self.sat_lifespan_years
                 + lifespan_damage_fraction,
             )
+            fueled_cohort_before_loss = shell.cam_fueled_sat_count
+            depleted_cohort_before_loss = shell.cam_depleted_sat_count
             legacy_loss = shell.legacy_sat_count * loss_fraction
             new_loss = shell.new_sat_count * loss_fraction
             total_satellite_loss = legacy_loss + new_loss
@@ -915,8 +1249,20 @@ class KesslerSimulation:
             shell.satellite_mass_kg -= lost_satellite_mass
 
             # PMD Failure Logic: Failed sats explicitly become massive Derelicts
-            failed_sats = total_satellite_loss * self.pmd_failure_rate
-            failed_satellite_mass = lost_satellite_mass * self.pmd_failure_rate
+            fueled_retirements = fueled_cohort_before_loss * loss_fraction
+            depleted_retirements = depleted_cohort_before_loss * loss_fraction
+            failed_sats = (
+                fueled_retirements * self.pmd_failure_rate
+                + depleted_retirements
+            )
+            failed_satellite_mass = (
+                lost_satellite_mass * failed_sats / total_satellite_loss
+                if total_satellite_loss > 0.0 else 0.0
+            )
+            shell.cam_fueled_sat_count = max(
+                0.0, shell.cam_fueled_sat_count - fueled_retirements
+            )
+            shell.cam_burns_remaining *= 1.0 - loss_fraction
             shell.derelict_count += failed_sats
             shell.derelict_mass_kg += failed_satellite_mass
             self.reentered_mass_kg += lost_satellite_mass - failed_satellite_mass
@@ -947,6 +1293,7 @@ class KesslerSimulation:
                 shell.new_sat_count += per_shell
                 launched_mass = per_shell * SATELLITE_MASS_KG
                 shell.satellite_mass_kg += launched_mass
+                shell.add_cam_fueled_satellites(per_shell)
                 self.launched_mass_kg += launched_mass
 
         self.current_year += dt_years
