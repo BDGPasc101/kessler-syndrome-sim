@@ -1,10 +1,59 @@
 import math
 
-def calculate_atmospheric_density(altitude_km: float) -> float:
+SOLAR_CYCLE_PERIOD_YEARS = 11.0
+SOLAR_CYCLE_DENSITY_AMPLITUDE = 0.5
+
+
+def solar_cycle_density_multiplier(simulation_year: float) -> float:
+    """Return a mean-one, 11-year density cycle with solar maximum at year 0."""
+    if not math.isfinite(simulation_year):
+        raise ValueError("simulation_year must be finite.")
+    phase = (
+        2.0
+        * math.pi
+        * (simulation_year % SOLAR_CYCLE_PERIOD_YEARS)
+        / SOLAR_CYCLE_PERIOD_YEARS
+    )
+    return 1.0 + SOLAR_CYCLE_DENSITY_AMPLITUDE * math.cos(phase)
+
+
+def maximum_solar_cycle_density_multiplier(
+    start_year: float, duration_years: float
+) -> float:
+    """Return the largest density multiplier over a simulation-time interval."""
+    if not math.isfinite(start_year) or not math.isfinite(duration_years):
+        raise ValueError("Solar-cycle interval values must be finite.")
+    if duration_years < 0.0:
+        raise ValueError("duration_years must not be negative.")
+
+    end_year = start_year + duration_years
+    if not math.isfinite(end_year):
+        raise ValueError("Solar-cycle interval end must be finite.")
+    maximum = max(
+        solar_cycle_density_multiplier(start_year),
+        solar_cycle_density_multiplier(end_year),
+    )
+    if duration_years >= SOLAR_CYCLE_PERIOD_YEARS:
+        maximum = 1.0 + SOLAR_CYCLE_DENSITY_AMPLITUDE
+    else:
+        remainder = start_year % SOLAR_CYCLE_PERIOD_YEARS
+        time_to_peak = (
+            0.0 if remainder == 0.0 else SOLAR_CYCLE_PERIOD_YEARS - remainder
+        )
+        if time_to_peak <= duration_years:
+            maximum = 1.0 + SOLAR_CYCLE_DENSITY_AMPLITUDE
+    return maximum
+
+
+def calculate_atmospheric_density(
+    altitude_km: float, density_multiplier: float = 1.0
+) -> float:
     """
     Approximates Earth's atmospheric density using a simple exponential model.
     Values are calibrated for a mean solar cycle in Low Earth Orbit (LEO).
     """
+    if not math.isfinite(density_multiplier) or density_multiplier < 0.0:
+        raise ValueError("density_multiplier must be finite and nonnegative.")
     if altitude_km > 1200:
         return 0.0  # Absolute vacuum for our simulation purposes
         
@@ -13,13 +62,18 @@ def calculate_atmospheric_density(altitude_km: float) -> float:
     rho0 = 1.37e-13  # Reference density in kg/m^3
     H = 50.0         # Scale height in km (how fast density drops off)
     
-    return rho0 * math.exp(-(altitude_km - h0) / H)
+    return (
+        rho0
+        * math.exp(-(altitude_km - h0) / H)
+        * density_multiplier
+    )
 
 def calculate_orbital_decay_rate(
     altitude_km: float,
     mass_kg: float,
     cross_section_m2: float,
-    drag_coefficient: float = 2.2
+    drag_coefficient: float = 2.2,
+    density_multiplier: float = 1.0,
 ) -> dict:
     """
     Calculates how fast an object is losing altitude due to atmospheric drag.
@@ -29,7 +83,9 @@ def calculate_orbital_decay_rate(
     :param cross_section_m2: Frontal area facing the "wind".
     :param drag_coefficient: Aerodynamic shape factor (2.2 is standard for satellites).
     """
-    density_kg_m3 = calculate_atmospheric_density(altitude_km)
+    density_kg_m3 = calculate_atmospheric_density(
+        altitude_km, density_multiplier
+    )
     
     # 1. Ballistic Coefficient (kg/m^2) = M / (Cd * A)
     # A higher BC means the object punches through the air easier (e.g., a bowling ball).
