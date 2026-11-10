@@ -1,10 +1,31 @@
 import math
+from typing import Optional
+
+EARTH_MU_KM3_S2 = 3.986e5
+EARTH_RADIUS_KM = 6371.0
+AVERAGE_COLLISION_ANGLE_DEG = 90.0
+
+
+def calculate_relative_velocity_km_s(altitude_km: float) -> float:
+    """Estimate relative speed for circular orbits at a shared altitude."""
+    if not math.isfinite(altitude_km) or altitude_km <= -EARTH_RADIUS_KM:
+        raise ValueError("altitude_km must be finite and above Earth's center.")
+
+    orbital_radius_km = EARTH_RADIUS_KM + altitude_km
+    orbital_velocity_km_s = math.sqrt(EARTH_MU_KM3_S2 / orbital_radius_km)
+    collision_angle_rad = math.radians(AVERAGE_COLLISION_ANGLE_DEG)
+    relative_velocity_squared = 2.0 * orbital_velocity_km_s**2 * (
+        1.0 - math.cos(collision_angle_rad)
+    )
+    return math.sqrt(relative_velocity_squared)
+
 
 def calculate_impact_metrics(
     spatial_density_km3: float,
     cross_section_m2: float,
     time_horizon_years: float,
-    relative_velocity_km_s: float = 10.0
+    relative_velocity_km_s: float = 10.0,
+    lethal_spatial_density_km3: Optional[float] = None,
 ) -> dict:
     """
     Calculates the risk of a satellite being hit by debris in a specific orbital shell.
@@ -12,30 +33,51 @@ def calculate_impact_metrics(
     :param spatial_density_km3: Number of debris objects per cubic kilometer in this shell.
     :param cross_section_m2: The frontal area of the satellite in square meters.
     :param time_horizon_years: How long the satellite plans to operate in this shell.
-    :param relative_velocity_km_s: Average impact speed (LEO average is ~10 km/s).
+    :param relative_velocity_km_s: Average impact speed in km/s.
+    :param lethal_spatial_density_km3: Density of projectiles treated as lethal.
+        Defaults to spatial_density_km3 for backward compatibility.
     """
-    # 1. Convert cross-section to square kilometers to match density units
+    if lethal_spatial_density_km3 is None:
+        lethal_spatial_density_km3 = spatial_density_km3
+    inputs = (
+        spatial_density_km3,
+        lethal_spatial_density_km3,
+        cross_section_m2,
+        time_horizon_years,
+        relative_velocity_km_s,
+    )
+    if not all(math.isfinite(value) for value in inputs):
+        raise ValueError("Impact metric inputs must be finite.")
+    if any(value < 0 for value in inputs):
+        raise ValueError("Impact metric inputs must be nonnegative.")
+
     cross_section_km2 = cross_section_m2 / 1_000_000.0
-    
-    # 2. Calculate volumetric sweep rate (Collisions per second)
-    # Rate = Density * Area * Velocity
-    rate_per_second = spatial_density_km3 * cross_section_km2 * relative_velocity_km_s
-    
-    # 3. Convert to annualized metrics
     seconds_per_year = 365.25 * 24 * 3600
-    rate_per_year = rate_per_second * seconds_per_year
-    
-    # 4. Calculate Mean Time Between Impacts (MTBI)
+
+    rate_per_year = (
+        spatial_density_km3
+        * cross_section_km2
+        * relative_velocity_km_s
+        * seconds_per_year
+    )
+    lethal_rate_per_year = (
+        lethal_spatial_density_km3
+        * cross_section_km2
+        * relative_velocity_km_s
+        * seconds_per_year
+    )
     mtbi_years = 1.0 / rate_per_year if rate_per_year > 0 else float('inf')
-    
-    # 5. Poisson Probability of AT LEAST ONE collision over the time horizon
-    # P(>0) = 1 - e^(-rate * time)
     probability_of_impact = 1.0 - math.exp(-rate_per_year * time_horizon_years)
+    probability_of_catastrophic_breach = (
+        1.0 - math.exp(-lethal_rate_per_year * time_horizon_years)
+    )
     
     return {
         "rate_per_year": rate_per_year,
         "mtbi_years": mtbi_years,
-        "probability_of_impact": probability_of_impact
+        "probability_of_impact": probability_of_impact,
+        "lethal_rate_per_year": lethal_rate_per_year,
+        "probability_of_catastrophic_breach": probability_of_catastrophic_breach,
     }
 
 # --- Quick Validation Test ---

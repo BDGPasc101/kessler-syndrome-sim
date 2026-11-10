@@ -22,7 +22,8 @@ $$\text{Flux} = \rho \cdot v_{\text{rel}}$$
 $$\text{Collision Rate} = \rho \cdot \sigma \cdot v_{\text{rel}} \cdot \Delta t$$
 
 * $\sigma$: Combined collision cross-section ($\text{m}^2$)
-* $v_{\text{rel}}$: Mean relative velocity in LEO, calibrated to $10.0\text{ km/s}$
+* $v_{\text{rel}}$: Estimated from circular orbital speed at the shell altitude using $\mu = 3.986 \times 10^5\text{ km}^3/\text{s}^2$, $R_E = 6371\text{ km}$, and a $90^\circ$ average collision angle:
+  $$v_{\text{rel}} = \sqrt{2}\sqrt{\frac{\mu}{R_E + h}}$$
 
 The probability of impact over a mission lifetime $T$ uses Poisson statistics:
 $$P(\text{impact}) = 1 - e^{-\text{Rate} \cdot T}$$

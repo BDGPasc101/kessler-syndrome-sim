@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import numpy as np # Make sure numpy is imported at the top of your app.py
 
 from src.simulation import KesslerSimulation
 from src.physics.collisions import calculate_impact_metrics
@@ -8,7 +9,7 @@ from src.physics.collisions import calculate_impact_metrics
 st.set_page_config(page_title="Kessler Syndrome Simulator", layout="wide")
 
 @st.cache_data
-def run_simulation(years: int, base_launches: int, growth_rate_pct: float, global_lifespan: int, pmd_failure_pct: float, laser_removals: int):
+def run_simulation(years: int, base_launches: int, growth_rate_pct: float, global_lifespan: int, pmd_failure_pct: float, laser_removals: int, enable_dynamic_highway_routing: bool):
     sim = KesslerSimulation()
     
     sim.base_annual_launches = base_launches
@@ -16,6 +17,7 @@ def run_simulation(years: int, base_launches: int, growth_rate_pct: float, globa
     sim.sat_lifespan_years = float(global_lifespan)
     sim.pmd_failure_rate = pmd_failure_pct / 100.0   # Added this line
     sim.laser_removals_per_year = laser_removals
+    sim.enable_dynamic_highway_routing = enable_dynamic_highway_routing
     
     history = []
     
@@ -25,9 +27,11 @@ def run_simulation(years: int, base_launches: int, growth_rate_pct: float, globa
                 "Year": 0,
                 "Altitude (km)": shell.altitude_km,
                 "Circular Debris": shell.debris_count,
+                "Heavy Debris": shell.heavy_debris_count,
                 "Transiting Debris": sim.get_transiting_debris_in_shell(shell.altitude_km),
                 "Derelict Satellites": shell.derelict_count,  # NEW
                 "Active Satellites": shell.sat_count,
+                "Diverted Launches": sim.launches_diverted_this_step,
                 "Volume (km3)": shell.volume_km3
             })
         
@@ -39,15 +43,19 @@ def run_simulation(years: int, base_launches: int, growth_rate_pct: float, globa
                 "Year": year, # (or 0 for the first loop)
                 "Altitude (km)": shell.altitude_km,
                 "Circular Debris": shell.debris_count,
+                "Heavy Debris": shell.heavy_debris_count,
                 "Transiting Debris": sim.get_transiting_debris_in_shell(shell.altitude_km),
                 "Derelict Satellites": shell.derelict_count,  # NEW
                 "Active Satellites": shell.sat_count,
+                "Diverted Launches": sim.launches_diverted_this_step,
                 "Volume (km3)": shell.volume_km3
             })
             
     df = pd.DataFrame(history)
     # Effective debris is what satellites actually collide with
-    df["Effective Debris"] = df["Circular Debris"] + df["Transiting Debris"]
+    df["Effective Debris"] = (
+        df["Circular Debris"] + df["Heavy Debris"] + df["Transiting Debris"]
+    )
     return df
 
 # --- SIDEBAR CONFIGURATION ---
@@ -77,14 +85,29 @@ with st.sidebar.expander("ADR Financial Assumptions"):
 st.sidebar.header("Simulation Parameters")
 sim_years = st.sidebar.slider("Years to Simulate", min_value=10, max_value=200, value=100, step=10)
 
-st.sidebar.header("Single Mission Profile")
-sat_altitude = st.sidebar.selectbox("Target Orbit (km)", range(400, 1050, 50), index=3) 
+st.sidebar.header("Mission Viability Profile")
+enable_dynamic_highway_routing = st.sidebar.toggle(
+    "Enable Dynamic Highway Routing",
+    value=True,
+    help="Divert launches from the 450 km Highway to the Expansion Shelf when lethal-impact survival falls below 95%.",
+)
+sat_altitude = st.sidebar.selectbox(
+    "Viability Chart Altitude (km)", range(300, 1050, 50), index=5
+)
 sat_area_m2 = st.sidebar.slider("Cross-Section Area (m²)", min_value=1.0, max_value=100.0, value=10.0, step=1.0)
 sat_lifespan = st.sidebar.slider("Planned Mission Duration (Years)", min_value=1, max_value=25, value=5)
 
 # --- RUN SIMULATION ---
 with st.spinner("Integrating ODEs & crossing hazards..."):
-    df_history = run_simulation(sim_years, base_launches, launch_growth, global_lifespan, pmd_failure_pct, laser_removals)
+    df_history = run_simulation(
+        sim_years,
+        base_launches,
+        launch_growth,
+        global_lifespan,
+        pmd_failure_pct,
+        laser_removals,
+        enable_dynamic_highway_routing,
+    )
 
 # --- MAIN DASHBOARD ---
 st.title("🌍 Orbital Debris Cascade Simulator")
@@ -96,25 +119,31 @@ df_end = df_history[df_history["Year"] == sim_years]
 total_debris_start = df_start["Circular Debris"].sum()
 total_debris_end = df_end["Circular Debris"].sum()
 net_debris = total_debris_end - total_debris_start
+total_heavy_debris_end = df_end["Heavy Debris"].sum()
 total_transiting_end = df_end["Transiting Debris"].sum()
 total_derelicts_end = df_end["Derelict Satellites"].sum()  # NEW
 
 total_sats_start = df_start["Active Satellites"].sum()
 total_sats_end = df_end["Active Satellites"].sum()
 
-# Adjust columns to fit the new metric
-col1, col2, col3, col4, col5 = st.columns(5)
+# Adjust columns to fit the debris population metrics
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 col1.metric("Initial Debris (>1cm)", f"{total_debris_start:,.0f}")
 col2.metric(f"Circular Debris (Yr {sim_years})", f"{total_debris_end:,.0f}", delta=f"{net_debris:,.0f} frags", delta_color="inverse")
+col3.metric(
+    f"Heavy Debris (Yr {sim_years})",
+    f"{total_heavy_debris_end:,.0f}",
+    help="Tracked 10 kg structural chunks, with their own atmospheric drag profile.",
+)
 
 # The new metric tracking dead satellite buses
-col3.metric(
+col4.metric(
     "Derelict Satellites", 
     f"{total_derelicts_end:,.0f}", 
     help="Massive dead satellites that failed PMD. Extremely high cross-section targets."
 )
 
-col4.metric(f"Active Sats (Yr {sim_years})", f"{total_sats_end:,.0f}")
+col5.metric(f"Active Sats (Yr {sim_years})", f"{total_sats_end:,.0f}")
 
 # --- FINANCIAL CALCULATIONS ---
 if laser_removals > 0:
@@ -123,7 +152,7 @@ if laser_removals > 0:
     annual_laser_cost = annual_fixed_opex + (laser_removals * cost_per_shot)
     total_program_cost = (laser_base_cost * num_facilities) + (annual_laser_cost * sim_years)
     
-    col5.metric(
+    col6.metric(
         label="ADR Program Cost", 
         value=f"${annual_laser_cost / 1_000_000:.1f}M / yr", 
         delta=f"${total_program_cost / 1_000_000_000:.2f}B Total", 
@@ -131,14 +160,22 @@ if laser_removals > 0:
     )
 else:
     total_program_cost = 0.0
-    col5.metric("ADR Program Cost", "$0 / yr", "System Offline")
-    
+    col6.metric("ADR Program Cost", "$0 / yr", "System Offline")
+
+diverted_launches = df_history.loc[
+    df_history["Year"] == sim_years, "Diverted Launches"
+].iloc[0]
+st.metric(
+    f"Launches Diverted Due to Congestion (Yr {sim_years})",
+    f"{diverted_launches:,.0f}",
+)
+
 st.divider()
 
 # --- TABS ---
-tab_heatmap, tab_transit, tab_sats, tab_lifespan, tab_finance = st.tabs([
+tab_heatmap, tab_debris, tab_sats, tab_lifespan, tab_finance = st.tabs([
     "Effective Debris Heatmap", 
-    "Laser Transit Composition",
+    "Debris Population",
     "Satellite Population", 
     "Mission Viability",
     "Program Funding"
@@ -146,24 +183,64 @@ tab_heatmap, tab_transit, tab_sats, tab_lifespan, tab_finance = st.tabs([
 
 with tab_heatmap:
     st.subheader("Effective Collision Hazard Over Time")
-    st.caption("Combines stable circular debris and temporary transiting debris falling through lower orbits.")
+    st.caption("Combines 1 cm shrapnel, heavy structural chunks, and temporary transiting debris.")
     pivot_df = df_history.pivot(index="Altitude (km)", columns="Year", values="Effective Debris")
     fig_heat = px.imshow(pivot_df, labels=dict(x="Simulation Year", y="Altitude (km)", color="Hazard Count"), x=pivot_df.columns, y=pivot_df.index, color_continuous_scale="Inferno", aspect="auto", origin="lower")
     fig_heat.update_layout(template="plotly_dark", height=500)
     st.plotly_chart(fig_heat, use_container_width=True)
 
-with tab_transit:
-    st.subheader("Global Debris Inventory: Circular vs. Transiting")
-    st.caption("Laser removal trades permanent circular debris for a temporary wave of highly-elliptical transiting debris.")
-    df_agg = df_history.groupby("Year")[["Circular Debris", "Transiting Debris"]].sum().reset_index()
-    fig_inv = px.area(df_agg, x="Year", y=["Circular Debris", "Transiting Debris"], color_discrete_sequence=["#EF553B", "#FFA15A"])
-    fig_inv.update_layout(template="plotly_dark", height=450, yaxis_title="Debris Object Count", legend_title="Orbital Phase")
+with tab_debris:
+    st.subheader("Global Debris Inventory")
+    st.caption("Shows 1 cm shrapnel, 10 kg heavy chunks, and temporary transiting debris. (Logarithmic Scale)")
+    df_agg = df_history.groupby("Year")[[
+        "Circular Debris", "Heavy Debris", "Transiting Debris"
+    ]].sum().reset_index()
+    
+    # ADDED log_y=True here
+    fig_inv = px.area(
+        df_agg,
+        x="Year",
+        y=["Circular Debris", "Heavy Debris", "Transiting Debris"],
+        color_discrete_sequence=["#EF553B", "#AB63FA", "#FFA15A"],
+    )
+    
+    # Update layout to explicitly set the Y-axis type to log
+    fig_inv.update_layout(
+        template="plotly_dark", 
+        height=450, 
+        yaxis_title="Debris Object Count (Log Scale)", 
+        legend_title="Population",
+        yaxis_type="log"  # Enforces log scale on the area chart
+    )
     st.plotly_chart(fig_inv, use_container_width=True)
     
 with tab_sats:
     st.subheader("Active Satellite Population by Altitude")
+    st.caption("Color scale is logarithmic to show detail across extreme density differences.")
+    
+    # 1. Pivot the raw data
     pivot_sats = df_history.pivot(index="Altitude (km)", columns="Year", values="Active Satellites")
-    fig_sats = px.imshow(pivot_sats, labels=dict(x="Simulation Year", y="Altitude (km)", color="Active Satellites"), x=pivot_sats.columns, y=pivot_sats.index, color_continuous_scale="Viridis", aspect="auto", origin="lower")
+    
+    # 2. Create a log10 version of the data for the colors (add +1 to avoid log(0) errors)
+    log_pivot_sats = np.log10(pivot_sats + 1)
+    
+    # 3. Plot using the log data for color
+    fig_sats = px.imshow(
+        log_pivot_sats, 
+        labels=dict(x="Simulation Year", y="Altitude (km)", color="Log10(Satellites)"), 
+        x=pivot_sats.columns, 
+        y=pivot_sats.index, 
+        color_continuous_scale="Viridis", 
+        aspect="auto", 
+        origin="lower"
+    )
+    
+    # 4. Inject the raw, un-logged numbers into the hover tooltip
+    fig_sats.update_traces(
+        customdata=pivot_sats.values,
+        hovertemplate="Year: %{x}<br>Altitude: %{y} km<br>Active Satellites: %{customdata:,.0f}<extra></extra>"
+    )
+    
     fig_sats.update_layout(template="plotly_dark", height=500)
     st.plotly_chart(fig_sats, use_container_width=True)
 
@@ -173,15 +250,33 @@ with tab_lifespan:
     mtbi_list = []
     prob_list = []
     for _, row in df_alt.iterrows():
-        # Density now actively includes the transiting fallout crossing this specific shell
-        spatial_density = row["Effective Debris"] / row["Volume (km3)"]
-        metrics = calculate_impact_metrics(spatial_density, sat_area_m2, sat_lifespan, 10.0)
+        volume_km3 = row["Volume (km3)"]
+        spatial_density = (
+            row["Effective Debris"] + row["Derelict Satellites"]
+        ) / volume_km3
+        lethal_spatial_density = (
+            row["Heavy Debris"] + row["Derelict Satellites"]
+        ) / volume_km3
+        metrics = calculate_impact_metrics(
+            spatial_density,
+            sat_area_m2,
+            sat_lifespan,
+            10.0,
+            lethal_spatial_density_km3=lethal_spatial_density,
+        )
         mtbi_list.append(metrics["mtbi_years"] if metrics["mtbi_years"] < 10000 else 10000)
-        prob_list.append(metrics["probability_of_impact"] * 100.0)
+        prob_list.append(
+            metrics["probability_of_catastrophic_breach"] * 100.0
+        )
     df_alt["MTBI (Years)"] = mtbi_list
     df_alt["Catastrophic Breach Risk (%)"] = prob_list
     
-    fig_prob = px.bar(df_alt, x="Year", y="Catastrophic Breach Risk (%)", title=f"Probability of being hit during a {sat_lifespan}-year mission", color="Catastrophic Breach Risk (%)", color_continuous_scale="Reds")
+    st.caption(
+        "Lethal-risk estimate uses heavy debris and derelict satellites only; "
+        "shrapnel is excluded, although sub-threshold impacts on exposed satellite "
+        "areas can cause mission kills."
+    )
+    fig_prob = px.bar(df_alt, x="Year", y="Catastrophic Breach Risk (%)", title=f"Probability of catastrophic breach during a {sat_lifespan}-year mission", color="Catastrophic Breach Risk (%)", color_continuous_scale="Reds")
     fig_prob.update_layout(template="plotly_dark", height=400, yaxis_range=[0, 100])
     st.plotly_chart(fig_prob, use_container_width=True)
 
