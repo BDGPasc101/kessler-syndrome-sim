@@ -1,4 +1,11 @@
 # Kessler Syndrome Simulator
+
+# Setup steps:
+git clone <repo-url>
+pip install -r requirements.txt
+streamlit run app.py
+
+# Info
 Stochastic modeling of orbital debris cascade and satellite lifespan prediction.
 
 Catastrophic breakup ejecta is tracked as two debris populations: 1 cm shrapnel
