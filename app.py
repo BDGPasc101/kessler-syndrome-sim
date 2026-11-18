@@ -9,6 +9,61 @@ from src.physics.drag import SOLAR_CYCLE_PERIOD_YEARS
 
 st.set_page_config(page_title="Kessler Syndrome Simulator", layout="wide")
 
+DEMO_PRESETS = {
+    "Custom": {
+        "description": "Set each sidebar control manually.",
+        "values": {},
+    },
+    "1. Baseline Stabilization (Self-Regulating)": {
+        "description": "A stable launch environment tests whether strong CAM and PMD practices can keep debris growth in check.",
+        "values": {
+            "sim_years": 50,
+            "base_launches": 2500,
+            "launch_growth": 0.0,
+            "global_lifespan": 5,
+            "pmd_failure_pct": 10.0,
+            "cams_efficiency_pct": 90,
+            "cam_burns_per_satellite": 75,
+            "enable_dynamic_highway_routing": True,
+            "laser_removals": 0,
+        },
+    },
+    "2. The Propellant Cliff (Cascade Trigger)": {
+        "description": "Rapid launch growth and a limited CAM reserve expose how propellant depletion can trigger a debris cascade.",
+        "values": {
+            "sim_years": 80,
+            "base_launches": 4000,
+            "launch_growth": 5.0,
+            "global_lifespan": 5,
+            "pmd_failure_pct": 20.0,
+            "cams_efficiency_pct": 90,
+            "cam_burns_per_satellite": 40,
+            "enable_dynamic_highway_routing": True,
+            "laser_removals": 0,
+        },
+    },
+    "3. The Avoidance Paradox (The Meat Grinder)": {
+        "description": "Keep the Propellant Cliff assumptions but disable Highway routing to show the effects of concentrated traffic.",
+        "values": {
+            "sim_years": 80,
+            "base_launches": 4000,
+            "launch_growth": 5.0,
+            "global_lifespan": 5,
+            "pmd_failure_pct": 20.0,
+            "cams_efficiency_pct": 90,
+            "cam_burns_per_satellite": 40,
+            "enable_dynamic_highway_routing": False,
+            "laser_removals": 0,
+        },
+    },
+}
+
+
+def apply_demo_preset():
+    preset = DEMO_PRESETS[st.session_state["scenario_preset"]]
+    for key, value in preset["values"].items():
+        st.session_state[key] = value
+
 
 def add_solar_maximum_bands(figure, final_year: float):
     band_half_width = 1.75
@@ -93,22 +148,43 @@ def run_simulation(
     return df
 
 # --- SIDEBAR CONFIGURATION ---
+for key, value in {
+    "sim_years": 100,
+    "base_launches": 2500,
+    "launch_growth": 8.0,
+    "global_lifespan": 5,
+    "pmd_failure_pct": 10.0,
+    "cams_efficiency_pct": 90,
+    "cam_burns_per_satellite": 75,
+    "enable_dynamic_highway_routing": True,
+    "laser_removals": 0,
+}.items():
+    st.session_state.setdefault(key, value)
+
+selected_preset = st.sidebar.selectbox(
+    "Select Scenario Preset",
+    options=tuple(DEMO_PRESETS),
+    key="scenario_preset",
+    on_change=apply_demo_preset,
+)
+st.sidebar.caption(DEMO_PRESETS[selected_preset]["description"])
+
 st.sidebar.header("Global Space Economy")
-base_launches = st.sidebar.slider("Base Annual Launches", min_value=0, max_value=10000, value=2500, step=500)
-launch_growth = st.sidebar.slider("Annual Launch Growth (%)", min_value=0.0, max_value=30.0, value=8.0, step=1.0)
-global_lifespan = st.sidebar.slider("Constellation Lifespan (Years)", min_value=1, max_value=15, value=5)
+base_launches = st.sidebar.slider("Base Annual Launches", min_value=0, max_value=10000, step=500, key="base_launches")
+launch_growth = st.sidebar.slider("Annual Launch Growth (%)", min_value=0.0, max_value=30.0, step=1.0, key="launch_growth")
+global_lifespan = st.sidebar.slider("Constellation Lifespan (Years)", min_value=1, max_value=15, key="global_lifespan")
 pmd_failure_pct = st.sidebar.slider(
     "PMD Failure Rate (%)",
     min_value=0.0,
     max_value=100.0,
-    value=10.0,
     step=1.0,
+    key="pmd_failure_pct",
     help="Baseline percentage of satellites that fail to de-orbit. Cohorts that exhaust their CAM reserve have 0% PMD compliance and become derelicts at retirement.",
 )
 
 st.sidebar.header("Active Debris Removal")
 num_facilities = st.sidebar.slider("Global Laser Facilities", min_value=1, max_value=10, value=1, step=1, help="Number of ground stations built worldwide.")
-laser_removals = st.sidebar.slider("Total Laser Engagements / Year", min_value=0, max_value=1_000_000, value=0, step=50_000)
+laser_removals = st.sidebar.slider("Total Laser Engagements / Year", min_value=0, max_value=1_000_000, step=50_000, key="laser_removals")
 st.sidebar.caption("Fires on highest-risk shell. Creates 2-year transiting decay orbits.")
 
 with st.sidebar.expander("ADR Financial Assumptions (Per Facility)"):
@@ -124,12 +200,12 @@ with st.sidebar.expander("ADR Financial Assumptions"):
     cost_per_shot = st.number_input("Cost per Laser Blast ($)", value=2500, step=500, help="Energy and variable costs per ablation pulse.")
 
 st.sidebar.header("Simulation Parameters")
-sim_years = st.sidebar.slider("Years to Simulate", min_value=10, max_value=200, value=100, step=10)
+sim_years = st.sidebar.slider("Years to Simulate", min_value=10, max_value=200, step=10, key="sim_years")
 
 st.sidebar.header("Mission Viability Profile")
 enable_dynamic_highway_routing = st.sidebar.toggle(
     "Enable Dynamic Highway Routing",
-    value=True,
+    key="enable_dynamic_highway_routing",
     help="Divert launches from the 450 km Highway to the Expansion Shelf when lethal-impact survival falls below 95%.",
 )
 sat_altitude = st.sidebar.selectbox(
@@ -138,13 +214,13 @@ sat_altitude = st.sidebar.selectbox(
 sat_area_m2 = st.sidebar.slider("Cross-Section Area (m²)", min_value=1.0, max_value=100.0, value=10.0, step=1.0)
 sat_lifespan = st.sidebar.slider("Planned Mission Duration (Years)", min_value=1, max_value=25, value=5)
 cams_efficiency = st.sidebar.slider(
-    "CAM Avoidance Efficiency (%)", min_value=0, max_value=100, value=90
+    "CAM Avoidance Efficiency (%)", min_value=0, max_value=100, key="cams_efficiency_pct"
 ) / 100.0
 cam_burns_per_satellite = st.sidebar.slider(
     "CAM Burn Reserve (Burns / Satellite)",
     min_value=0,
     max_value=200,
-    value=75,
+    key="cam_burns_per_satellite",
     help="Average screening maneuvers available per satellite. Exhausted cohorts lose CAMs and fail PMD at retirement.",
 )
 cam_screening_radius_km = st.sidebar.slider(
